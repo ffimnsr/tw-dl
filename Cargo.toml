@@ -1,0 +1,25 @@
+[package]
+name = "tw-dl"
+version = "0.1.0"
+edition = "2021"
+description = "A CLI tool for downloading Telegram media via MTProto"
+license = "MIT"
+authors = ["Edward Fitz Abucay"]
+
+[[bin]]
+name = "tw-dl"
+path = "src/main.rs"
+
+[dependencies]
+grammers-client = "0.9"
+grammers-session = "0.9"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+indicatif = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+anyhow = "1"
+rpassword = "7"
+regex = "1"
+tokio-util = { version = "0.7", features = ["io"] }
