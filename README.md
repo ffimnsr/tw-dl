@@ -1,110 +1,117 @@
 # tw-dl
 
-A Rust CLI for downloading Telegram media (videos, documents, audio, photos) via MTProto.
+`tw-dl` is a Rust CLI for downloading Telegram media through MTProto.
 
-`tw-dl` authenticates as a regular Telegram user and downloads media from messages in channels or groups that your account is a member of and can legitimately view. It does **not** bypass any Telegram restrictions.
+It signs in as your normal Telegram account and can download media from chats, channels, and groups your account can already access. It does not bypass Telegram permissions or restrictions.
+
+## What It Does
+
+- Downloads media from Telegram message links
+- Supports public links like `https://t.me/channel/123`
+- Supports private/supergroup links like `https://t.me/c/1234567890/123`
+- Supports direct targeting with `--peer` and `--msg`
+- Supports batch downloads from a text file with `--file`
+- Stores your login session locally so you only need to sign in once
+- Loads Telegram API credentials from `.env` automatically
 
 ## Quick Start
 
 ```bash
-# 1. Get API credentials from https://my.telegram.org/apps
-# 2. Clone and build
 git clone https://github.com/ffimnsr/tw-dl
 cd tw-dl
 cargo build --release
 
-# 3. Create a .env file
-cat > .env <<'EOF'
-TELEGRAM_API_ID=your_api_id
-TELEGRAM_API_HASH=your_api_hash
-EOF
+cp .env.example .env
+# edit .env and fill in your Telegram API credentials
 
-# 4. Login once
 ./target/release/tw-dl login
-
-# 5. Download media
 ./target/release/tw-dl download https://t.me/channelname/123
 ```
 
 ## Requirements
 
-- **Telegram account**: You need an active Telegram account (phone number)
-- **Telegram API credentials**: `api_id` and `api_hash` from <https://my.telegram.org/apps>
-- **Rust toolchain** (1.70+) for building from source
+- A Telegram account
+- Telegram API credentials from <https://my.telegram.org/apps>
+- Rust 1.70+ if building from source
 
-## Getting Started
+## Installation
 
-### Step 1: Obtain Telegram API Credentials
-
-1. Go to <https://my.telegram.org> and log in with your Telegram account
-2. Click on **"API development tools"**
-3. Fill out the form to create a new application:
-   - **App title**: (e.g., "tw-dl")
-   - **Short name**: (e.g., "twdl")
-   - **Platform**: Choose any (e.g., "Desktop")
-   - **Description**: (optional)
-4. Click **"Create application"**
-5. You'll receive your **api_id** (numeric) and **api_hash** (32-character hex string)
-6. **Keep these credentials secure** – treat them like passwords
-
-### Step 2: Installation
+Build a release binary:
 
 ```bash
-git clone https://github.com/ffimnsr/tw-dl
-cd tw-dl
 cargo build --release
-# Binary is at target/release/tw-dl
 ```
 
-Optionally, install to your system:
+The compiled binary will be available at:
+
+```bash
+./target/release/tw-dl
+```
+
+Optional global install:
+
 ```bash
 cargo install --path .
-# Now 'tw-dl' is available globally
 ```
 
-### Step 3: Configuration
+## Configuration
 
-Create a `.env` file in the project directory with the credentials from Step 1:
+### 1. Get Telegram API Credentials
+
+Go to <https://my.telegram.org/apps> and create an application. Telegram will give you:
+
+- `api_id`
+- `api_hash`
+
+Treat these like secrets.
+
+### 2. Create a `.env` File
+
+`tw-dl` loads `.env` automatically with `dotenvy`.
 
 ```env
 TELEGRAM_API_ID=12345678
 TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
 ```
 
-`tw-dl` loads `.env` automatically at startup using `dotenvy`.
+You can start from the included example:
 
-Shell environment variables still work and override values from `.env` when both are present.
+```bash
+cp .env.example .env
+```
 
-**Alternative shell setup (Linux/macOS):**
+Shell environment variables also work and take precedence over `.env` values if both are set.
+
+Linux/macOS:
+
 ```bash
 export TELEGRAM_API_ID=12345678
 export TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
 ```
 
-**Alternative shell setup (Windows PowerShell):**
+Windows PowerShell:
+
 ```powershell
 $env:TELEGRAM_API_ID="12345678"
 $env:TELEGRAM_API_HASH="abcdef1234567890abcdef1234567890"
 ```
 
-## Usage
+## First Login
 
-### Step 4: Login to Telegram
-
-Authenticate with your Telegram account. This only needs to be done **once** – the session is saved to disk.
+Authenticate once and `tw-dl` will save your session locally.
 
 ```bash
 tw-dl login
 ```
 
-**What happens during login:**
-1. You'll be prompted to enter your **phone number** (in international format, e.g., `+15550001234`)
-2. Telegram will send a **verification code** to your Telegram app (or SMS)
-3. Enter the code when prompted
-4. If you have **two-factor authentication (2FA)** enabled, you'll be asked for your password
-5. Once authenticated, the session is saved to `~/.config/tw-dl/session` (Linux/macOS) or `%APPDATA%\tw-dl\session` (Windows)
+You will be prompted for:
 
-**Example:**
+1. Your phone number in international format
+2. The login code sent by Telegram
+3. Your 2FA password, if enabled
+
+Example:
+
 ```bash
 $ tw-dl login
 Phone number (international format, e.g. +15550001234): +15550001234
@@ -113,31 +120,61 @@ Signed in as Alice (id: 123456789)
 Session saved to '/Users/alice/.config/tw-dl/session'.
 ```
 
-**With 2FA:**
+## Command Overview
+
+Top-level help:
+
+```text
+Usage: tw-dl [OPTIONS] <COMMAND>
+```
+
+Commands:
+
+- `login` - authenticate and save a session
+- `whoami` - print the authenticated user as JSON
+- `download` - download media from one or more Telegram messages
+
+Global options:
+
+- `--session-path <FILE>`: use a custom session file
+- `-h, --help`: show help
+- `-V, --version`: show version
+
+## Commands
+
+### `login`
+
+Authenticate interactively and save your session.
+
 ```bash
-$ tw-dl login
-Phone number (international format, e.g. +15550001234): +15550001234
-Enter the code you received: 12345
-Two-factor authentication password (hint: your pet's name): ********
-Signed in successfully with 2FA.
-Session saved to '/Users/alice/.config/tw-dl/session'.
+tw-dl login
 ```
 
-**Custom session path:**
+Options:
+
+- `--session-path <FILE>`: path to the session file
+
+Examples:
+
 ```bash
-tw-dl --session-path /path/to/my.session login
-```
+tw-dl login
+tw-dl --session-path ~/.config/tw-dl/work.session login
 ```
 
-### Verify Your Login
+### `whoami`
 
-Print the currently authenticated user's info as JSON:
+Print the currently authenticated user as JSON.
 
 ```bash
 tw-dl whoami
 ```
 
-**Example output:**
+Options:
+
+- `--session-path <FILE>`: path to the session file
+
+Example output:
+
 ```json
 {
   "first_name": "Alice",
@@ -148,51 +185,102 @@ tw-dl whoami
 }
 ```
 
-### Step 5: Download Videos and Media
+### `download`
 
-Download media (videos, documents, photos, audio) from Telegram messages in channels or groups that you have access to.
+Download media from a Telegram message.
 
-#### Basic Usage
+```bash
+tw-dl download [OPTIONS] [LINK]
+```
 
-**Download from a public channel:**
+Arguments:
+
+- `[LINK]`: Telegram message link such as `https://t.me/...` or `https://t.me/c/...`
+
+Options:
+
+- `--peer <USERNAME_OR_ID>`: peer username or numeric channel ID
+- `--msg <ID>`: message ID used together with `--peer`
+- `-f, --file <FILE>`: file containing one Telegram link per line for batch download
+- `-o, --out <DIR>`: output directory
+- `--session-path <FILE>`: path to the session file
+
+Notes:
+
+- `--file` conflicts with `LINK`, `--peer`, and `--msg`
+- default output directory is `./downloads`
+
+## Download Examples
+
+Download from a public channel:
+
 ```bash
 tw-dl download https://t.me/mychannel/42
 ```
 
-**Download from a private channel/supergroup:**
+Download from a private channel or supergroup:
+
 ```bash
-# You must be a member of the channel
 tw-dl download https://t.me/c/1234567890/10
 ```
 
-**Download using username and message ID:**
+Download using a username and message ID:
+
 ```bash
 tw-dl download --peer mychannel --msg 42
-# Or with channel ID
+```
+
+Download using a numeric channel ID:
+
+```bash
 tw-dl download --peer 1234567890 --msg 42
 ```
 
-**Specify output directory:**
+Download to a specific directory:
+
 ```bash
-tw-dl download https://t.me/mychannel/42 --out ./my-videos
-# Default output directory is ./downloads
+tw-dl download https://t.me/mychannel/42 --out ./media
 ```
 
-#### Finding Telegram Message Links
+Batch download from a file:
 
-**For public channels/groups:**
-1. Open the channel in Telegram
-2. Click on a message with media
-3. Click the three dots (⋮) → "Copy Message Link"
-4. The link looks like: `https://t.me/channelname/123`
+```bash
+tw-dl download --file links.txt --out ./media
+```
 
-**For private channels/supergroups:**
-1. The link looks like: `https://t.me/c/1234567890/123`
-2. Right-click on a message → "Copy Message Link"
+Example `links.txt`:
 
-#### Download Output
+```text
+# one Telegram link per line
+https://t.me/channelname/101
+https://t.me/channelname/102
+https://t.me/c/1234567890/15
+```
 
-On success, `tw-dl` prints a JSON object with file details:
+Use a custom session:
+
+```bash
+tw-dl --session-path ~/.config/tw-dl/work.session download https://t.me/channel/123
+```
+
+## Supported Media
+
+`tw-dl` downloads media Telegram exposes as downloadable documents or photos, including common:
+
+- videos
+- audio files
+- documents
+- archives
+- photos
+
+If a message has no downloadable media, the command will fail with a clear error.
+
+## Progress and Output
+
+During downloads, progress is shown on stderr.
+
+Successful downloads print JSON to stdout, for example:
+
 ```json
 {
   "file": "downloads/video.mp4",
@@ -202,98 +290,75 @@ On success, `tw-dl` prints a JSON object with file details:
 }
 ```
 
-A **progress bar** is shown on stderr while downloading:
+This makes the tool easy to use both interactively and from scripts.
+
+## Session Storage
+
+Session files are stored as SQLite databases.
+
+Default session locations:
+
+- Linux/macOS: `~/.config/tw-dl/session`
+- Windows: `%APPDATA%\tw-dl\session`
+
+Security notes:
+
+- session files authenticate your Telegram account
+- do not commit them to version control
+- do not share them
+- restrict file permissions where possible
+
+To sign out, delete the session file and log in again later if needed.
+
+## Finding Telegram Message Links
+
+For public channels and groups:
+
+1. Open the message in Telegram
+2. Open the message menu
+3. Copy the message link
+
+Example format:
+
+```text
+https://t.me/channelname/123
 ```
-Downloading: video.mp4
-████████████████████████████████░░░░░░░░ 75% (78 MB / 104 MB)
+
+For private channels or supergroups, the format usually looks like:
+
+```text
+https://t.me/c/1234567890/123
 ```
 
-#### Supported Media Types
+## Troubleshooting
 
-- **Videos** (MP4, MKV, AVI, etc.)
-- **Documents** (PDF, ZIP, etc.)
-- **Photos** (JPEG, PNG, etc.)
-- **Audio** (MP3, FLAC, etc.)
+### `TELEGRAM_API_ID environment variable is not set`
 
-#### Important Notes
+Create a `.env` file or export the variable in your shell.
 
-⚠️ **Limitations:**
-- You can only download media from channels/groups you are a member of
-- `tw-dl` respects all Telegram restrictions and permissions
-- Private media requires proper access rights
-- Large files may take time depending on your connection speed
+### `Not logged in. Run tw-dl login first.`
 
-#### Troubleshooting
+Run:
 
-**"Not logged in" error:**
 ```bash
 tw-dl login
 ```
 
-**"Username not found" error:**
-- Verify the channel username is correct
-- Ensure you're a member of the channel/group
-- For private channels, use the numeric channel ID instead
+### `Username '...' not found`
 
-**"Failed to resolve username" error:**
-- The channel may not exist or is private
-- Use the full message link instead
+- check the username
+- make sure the chat exists
+- make sure your account can access it
+- use a numeric channel ID if the chat is private
 
-## Advanced Usage
+### `Could not find a chat with id=... in your dialogs`
 
-### Multiple Accounts
+Your account likely has not joined that chat, or the numeric ID is wrong.
 
-You can manage multiple Telegram accounts using different session files:
+### `This message does not contain downloadable media`
 
-```bash
-# Login with first account
-tw-dl --session-path ~/.config/tw-dl/work.session login
-
-# Login with second account
-tw-dl --session-path ~/.config/tw-dl/personal.session login
-
-# Download using specific account
-tw-dl --session-path ~/.config/tw-dl/work.session download https://t.me/channel/123
-```
-
-### Batch Downloads
-
-Download multiple videos by running the command multiple times:
-
-```bash
-tw-dl download https://t.me/channel/1 --out ./videos
-tw-dl download https://t.me/channel/2 --out ./videos
-tw-dl download https://t.me/channel/3 --out ./videos
-```
-
-Or use a shell script:
-```bash
-#!/bin/bash
-for msg_id in {1..10}; do
-  tw-dl download --peer mychannel --msg $msg_id --out ./videos
-done
-```
-
-## Session Storage
-
-Sessions are stored as **SQLite databases** and contain your authentication data. They persist across runs, so you only need to login once.
-
-**Default locations:**
-- **Linux/macOS**: `~/.config/tw-dl/session`
-- **Windows**: `%APPDATA%\tw-dl\session`
-
-**Custom session path:**
-```bash
-tw-dl --session-path /path/to/custom.session login
-tw-dl --session-path /path/to/custom.session download https://t.me/channel/123
-```
-
-**Session security:**
-- Session files grant access to your Telegram account
-- Keep them secure (chmod 600 on Unix systems)
-- Don't share or commit them to version control
-- To logout, simply delete the session file
+The target message exists, but it does not have downloadable photo/document media attached.
 
 ## License
 
-MIT – see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
