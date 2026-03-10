@@ -39,6 +39,7 @@ enum Commands {
     ///   tw-dl download https://t.me/mychannel/42
     ///   tw-dl download https://t.me/c/1234567890/10
     ///   tw-dl download --peer mychannel --msg 42 --out ./videos
+    ///   tw-dl download --file links.txt --out ./videos
     Download {
         /// Telegram message link (https://t.me/... or https://t.me/c/...)
         link: Option<String>,
@@ -50,6 +51,10 @@ enum Commands {
         /// Message id (used together with --peer)
         #[arg(long, value_name = "ID")]
         msg: Option<i32>,
+
+        /// File containing one Telegram link per line (batch download)
+        #[arg(long, short = 'f', value_name = "FILE", conflicts_with_all = ["link", "peer", "msg"])]
+        file: Option<PathBuf>,
 
         /// Output directory (default: ./downloads)
         #[arg(long, short = 'o', value_name = "DIR", default_value = "downloads")]
@@ -83,7 +88,7 @@ async fn main() -> Result<()> {
             auth::cmd_whoami(api_id, session_path).await?;
         }
 
-        Commands::Download { link, peer, msg, out } => {
+        Commands::Download { link, peer, msg, file, out } => {
             download::cmd_download(
                 api_id,
                 session_path,
@@ -92,6 +97,7 @@ async fn main() -> Result<()> {
                     peer,
                     msg_id: msg,
                     out_dir: out,
+                    file_list: file,
                 },
             )
             .await?;

@@ -8,6 +8,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::io::AsyncBufReadExt;
 
 use crate::link::{parse_link, ParsedLink};
 
@@ -17,6 +20,8 @@ pub struct DownloadArgs {
     pub peer: Option<String>,
     pub msg_id: Option<i32>,
     pub out_dir: PathBuf,
+    /// Path to a file containing one Telegram link per line.
+    pub file_list: Option<PathBuf>,
 }
 
 /// Entry-point for the `download` subcommand.
@@ -31,18 +36,48 @@ pub async fn cmd_download(
         bail!("Not logged in. Run `tw-dl login` first.");
     }
 
-    // Resolve peer and message-id from either the link or the explicit args
-    let (peer_spec, msg_id) = resolve_peer_msg(&args)?;
-
-    // Fetch the target message
-    let message = fetch_message(&client, &peer_spec, msg_id).await?;
-
-    // Download media
-    let result = download_media(&client, &message, &args.out_dir).await?;
-
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    if let Some(list_path) = &args.file_list {
+        // Batch mode: read links from file, one per line
+        let file = fs::File::open(list_path)
+            .await
+            .with_context(|| format!("Cannot open file list '{}'" , list_path.display()))?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut index: usize = 0;
+        while let Some(line) = lines.next_line().await? {
+            let link = line.trim().to_string();
+            // Skip blank lines and comments
+            if link.is_empty() || link.starts_with('#') {
+                continue;
+            }
+            index += 1;
+            eprintln!("[{}] {}", index, link);
+            let single = DownloadArgs {
+                link: Some(link.clone()),
+                peer: None,
+                msg_id: None,
+                out_dir: args.out_dir.clone(),
+                file_list: None,
+            };
+            match download_one(&client, &single).await {
+                Ok(result) => println!("{}", serde_json::to_string_pretty(&result)?),
+                Err(e) => eprintln!("[{}] ERROR {}: {:#}", index, link, e),
+            }
+        }
+    } else {
+        // Single download
+        let result = download_one(&client, &args).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
 
     Ok(())
+}
+
+/// Download a single link/peer+msg defined in `args`.
+async fn download_one(client: &Client, args: &DownloadArgs) -> Result<serde_json::Value> {
+    let (peer_spec, msg_id) = resolve_peer_msg(args)?;
+    let message = fetch_message(client, &peer_spec, msg_id).await?;
+    download_media(client, &message, &args.out_dir).await
 }
 
 // ── peer / message resolution ─────────────────────────────────────────────────
@@ -219,7 +254,7 @@ fn choose_filename_document(doc: &Document, message: &Message) -> String {
     )
 }
 
-/// Stream-download `downloadable` to `out_path`, showing a progress bar.
+/// Stream-download `downloadable` to `out_path`, showing a live progress bar.
 async fn stream_download<D: Downloadable>(
     client: &Client,
     downloadable: &D,
@@ -248,16 +283,26 @@ async fn stream_download<D: Downloadable>(
         pb
     };
 
-    let out_path_buf = out_path.to_path_buf();
-    client
-        .download_media(downloadable, &out_path_buf)
+    let mut file = fs::File::create(out_path)
         .await
-        .with_context(|| format!("Failed to download to '{}'", out_path.display()))?;
+        .with_context(|| format!("Failed to create file '{}'", out_path.display()))?;
 
-    // Approximate progress: finish immediately since download_media handles it internally
-    if total_bytes > 0 {
-        pb.set_position(total_bytes);
+    let mut download = client.iter_download(downloadable);
+    while let Some(chunk) = download
+        .next()
+        .await
+        .map_err(|e| anyhow::anyhow!("Download error: {}", e))?
+    {
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("Failed to write to '{}'", out_path.display()))?;
+        pb.inc(chunk.len() as u64);
     }
+
+    file.flush()
+        .await
+        .with_context(|| format!("Failed to flush '{}'", out_path.display()))?;
+
     pb.finish_with_message(format!("Saved to '{}'", out_path.display()));
 
     Ok(())
