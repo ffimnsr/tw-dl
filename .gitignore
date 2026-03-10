@@ -27,3 +27,6 @@ target
 
 # Default downloads directory created by tw-dl
 downloads/
+
+.env
+!.env.example

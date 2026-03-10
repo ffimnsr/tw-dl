@@ -13,9 +13,11 @@ git clone https://github.com/ffimnsr/tw-dl
 cd tw-dl
 cargo build --release
 
-# 3. Set environment variables
-export TELEGRAM_API_ID=your_api_id
-export TELEGRAM_API_HASH=your_api_hash
+# 3. Create a .env file
+cat > .env <<'EOF'
+TELEGRAM_API_ID=your_api_id
+TELEGRAM_API_HASH=your_api_hash
+EOF
 
 # 4. Login once
 ./target/release/tw-dl login
@@ -62,33 +64,28 @@ cargo install --path .
 
 ### Step 3: Configuration
 
-Set the following environment variables with the credentials from Step 1:
+Create a `.env` file in the project directory with the credentials from Step 1:
 
-| Variable           | Description                                  |
-|--------------------|----------------------------------------------|
-| `TELEGRAM_API_ID`  | Your Telegram API ID (numeric)               |
-| `TELEGRAM_API_HASH`| Your Telegram API hash (hex string)          |
+```env
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
+```
 
-**On Linux/macOS:**
+`tw-dl` loads `.env` automatically at startup using `dotenvy`.
+
+Shell environment variables still work and override values from `.env` when both are present.
+
+**Alternative shell setup (Linux/macOS):**
 ```bash
 export TELEGRAM_API_ID=12345678
 export TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
 ```
 
-To make these permanent, add them to your `~/.bashrc`, `~/.zshrc`, or `~/.profile`:
-```bash
-echo 'export TELEGRAM_API_ID=12345678' >> ~/.bashrc
-echo 'export TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890' >> ~/.bashrc
-source ~/.bashrc
-```
-
-**On Windows (PowerShell):**
+**Alternative shell setup (Windows PowerShell):**
 ```powershell
 $env:TELEGRAM_API_ID="12345678"
 $env:TELEGRAM_API_HASH="abcdef1234567890abcdef1234567890"
 ```
-
-For permanent setup on Windows, set them as system environment variables via System Properties → Environment Variables.
 
 ## Usage
 

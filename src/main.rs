@@ -14,7 +14,7 @@ use std::path::PathBuf;
     about = "Download Telegram media via MTProto",
     long_about = "A CLI tool for downloading videos, documents and photos from Telegram \
                   channels and groups that your account has access to.\n\n\
-                  Set TELEGRAM_API_ID and TELEGRAM_API_HASH environment variables before use."
+                  Configure TELEGRAM_API_ID and TELEGRAM_API_HASH in a .env file or your shell environment before use."
 )]
 struct Cli {
     /// Path to the session file (default: ~/.config/tw-dl/session)
@@ -59,6 +59,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load local .env configuration first; shell environment still takes precedence.
+    let _ = dotenvy::dotenv();
+
     let cli = Cli::parse();
 
     let session_path = session::resolve_session_path(cli.session_path)?;
