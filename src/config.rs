@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::IsTerminal;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -22,7 +23,7 @@ pub fn load_config(path: &Path) -> Result<Option<AppConfig>> {
     Ok(Some(config))
 }
 
-pub fn cmd_init(config_path: PathBuf, force: bool) -> Result<()> {
+pub fn cmd_init(config_path: PathBuf, force: bool, yes: bool) -> Result<()> {
     crate::session::ensure_parent_dir(&config_path)?;
 
     if config_path.exists() && !force {
@@ -30,6 +31,13 @@ pub fn cmd_init(config_path: PathBuf, force: bool) -> Result<()> {
             "Config file '{}' already exists. Re-run with --force to overwrite it.",
             config_path.display()
         );
+    }
+
+    if config_path.exists() && force && !yes {
+        confirm_action(format!(
+            "Overwrite existing config at '{}'?",
+            config_path.display()
+        ))?;
     }
 
     let api_id = prompt("Telegram API ID: ")?;
@@ -67,6 +75,19 @@ fn prompt(message: &str) -> Result<String> {
         .read_line(&mut line)
         .context("Failed to read input")?;
     Ok(line.trim().to_string())
+}
+
+fn confirm_action(message: String) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        bail!("Confirmation required. Re-run with `--yes` in non-interactive mode.");
+    }
+
+    let answer = prompt(&format!("{} [y/N]: ", message))?;
+    if matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(());
+    }
+
+    bail!("Aborted by user.");
 }
 
 #[cfg(test)]

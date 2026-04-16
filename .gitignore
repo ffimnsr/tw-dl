@@ -33,3 +33,4 @@ downloads/
 
 /*.md
 !README.md
+!ISSUES.md

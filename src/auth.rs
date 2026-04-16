@@ -1,20 +1,42 @@
 use anyhow::{Context, Result};
 use grammers_client::{Client, SenderPool, SignInError};
 use grammers_session::storages::SqliteSession;
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
+use std::io::IsTerminal;
 use std::io::{self, BufRead, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy)]
+pub struct SessionOptions {
+    pub force_unlock: bool,
+    pub stale_lock_timeout: Duration,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            force_unlock: false,
+            stale_lock_timeout: Duration::from_secs(30 * 60),
+        }
+    }
+}
 
 /// Build a Telegram `Client` connected to the network, loading or creating a
 /// session at `session_path`.
 ///
 /// Also spawns the network runner task on the Tokio runtime (a background task
 /// that processes all low-level MTProto I/O).
-pub async fn build_client(api_id: i32, session_path: &PathBuf) -> Result<AppClient> {
+pub async fn build_client(
+    api_id: i32,
+    session_path: &PathBuf,
+    session_options: SessionOptions,
+) -> Result<AppClient> {
     crate::session::ensure_parent_dir(session_path)?;
-    let session_lock = SessionLock::acquire(session_path)?;
+    let session_lock = SessionLock::acquire(session_path, session_options)?;
 
     let session = Arc::new(
         SqliteSession::open(session_path)
@@ -39,8 +61,13 @@ pub async fn build_client(api_id: i32, session_path: &PathBuf) -> Result<AppClie
 ///
 /// Prompts for phone number and the SMS/app code, handles optional 2FA, and
 /// saves the session.
-pub async fn cmd_login(api_id: i32, api_hash: &str, session_path: PathBuf) -> Result<()> {
-    let client = build_client(api_id, &session_path).await?;
+pub async fn cmd_login(
+    api_id: i32,
+    api_hash: &str,
+    session_path: PathBuf,
+    session_options: SessionOptions,
+) -> Result<()> {
+    let client = build_client(api_id, &session_path, session_options).await?;
 
     if client.is_authorized().await? {
         println!("Already logged in. Use `tw-dl whoami` to see current user.");
@@ -82,8 +109,12 @@ pub async fn cmd_login(api_id: i32, api_hash: &str, session_path: PathBuf) -> Re
 }
 
 /// `whoami` command – prints the currently logged-in user's details as JSON.
-pub async fn cmd_whoami(api_id: i32, session_path: PathBuf) -> Result<()> {
-    let client = build_client(api_id, &session_path).await?;
+pub async fn cmd_whoami(
+    api_id: i32,
+    session_path: PathBuf,
+    session_options: SessionOptions,
+) -> Result<()> {
+    let client = build_client(api_id, &session_path, session_options).await?;
 
     if !client.is_authorized().await? {
         anyhow::bail!("Not logged in. Run `tw-dl login` first.");
@@ -106,7 +137,14 @@ pub async fn cmd_whoami(api_id: i32, session_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_logout(session_path: &Path) -> Result<()> {
+pub fn cmd_logout(session_path: &Path, yes: bool) -> Result<()> {
+    if (session_path.exists() || session_path.with_extension("lock").exists()) && !yes {
+        confirm_action(format!(
+            "Remove the saved Telegram session at '{}'?",
+            session_path.display()
+        ))?;
+    }
+
     if crate::session::clear_session(session_path)? {
         println!("Cleared session at '{}'.", session_path.display());
     } else {
@@ -133,6 +171,19 @@ fn prompt(message: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+fn confirm_action(message: String) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("Confirmation required. Re-run with `--yes` in non-interactive mode.");
+    }
+
+    let answer = prompt(&format!("{} [y/N]: ", message))?;
+    if matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(());
+    }
+
+    anyhow::bail!("Aborted by user.");
+}
+
 fn display_name(user: &grammers_client::peer::User) -> String {
     let first = user.first_name().unwrap_or("");
     let last = user.last_name().unwrap_or("");
@@ -152,6 +203,12 @@ pub struct AppClient {
     _session_lock: SessionLock,
 }
 
+impl AppClient {
+    pub fn client(&self) -> Client {
+        self.client.clone()
+    }
+}
+
 impl Deref for AppClient {
     type Target = Client;
 
@@ -166,25 +223,77 @@ struct SessionLock {
 }
 
 impl SessionLock {
-    fn acquire(session_path: &Path) -> Result<Self> {
+    fn acquire(session_path: &Path, options: SessionOptions) -> Result<Self> {
         let lock_path = session_path.with_extension("lock");
+        if options.force_unlock && lock_path.exists() {
+            std::fs::remove_file(&lock_path).with_context(|| {
+                format!(
+                    "Failed to remove session lock file '{}' during force unlock",
+                    lock_path.display()
+                )
+            })?;
+        } else if let Some(age) = lock_age(&lock_path)? {
+            if age >= options.stale_lock_timeout {
+                std::fs::remove_file(&lock_path).with_context(|| {
+                    format!(
+                        "Failed to remove stale session lock file '{}'",
+                        lock_path.display()
+                    )
+                })?;
+            }
+        }
+
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&lock_path)
             .with_context(|| {
                 format!(
-                    "Session '{}' is already in use by another tw-dl process. Wait for it to finish or remove stale lock file '{}'.",
+                    "Session '{}' is already in use by another tw-dl process. Wait for it to finish, allow stale-lock expiry, or re-run with `--force-unlock` for lock file '{}'.",
                     session_path.display(),
                     lock_path.display()
                 )
             })?;
+
+        let metadata = LockMetadata {
+            pid: std::process::id(),
+            created_unix: unix_timestamp(),
+        };
+        serde_json::to_writer(&file, &metadata).context("Failed to write session lock metadata")?;
 
         Ok(Self {
             path: lock_path,
             _file: file,
         })
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct LockMetadata {
+    pid: u32,
+    created_unix: u64,
+}
+
+fn lock_age(lock_path: &Path) -> Result<Option<Duration>> {
+    if !lock_path.exists() {
+        return Ok(None);
+    }
+
+    let modified = std::fs::metadata(lock_path)
+        .with_context(|| format!("Failed to inspect lock file '{}'", lock_path.display()))?
+        .modified()
+        .with_context(|| format!("Failed to read lock mtime '{}'", lock_path.display()))?;
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default();
+    Ok(Some(age))
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 impl Drop for SessionLock {
