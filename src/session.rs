@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 
 /// Return the default session directory path: `~/.config/tw-dl/`
 fn default_session_dir() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir()
-        .context("Could not determine the user config directory")?;
+    let config_dir = dirs::config_dir().context("Could not determine the user config directory")?;
     Ok(config_dir.join("tw-dl"))
 }
 
@@ -25,9 +24,8 @@ pub fn resolve_session_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
 /// Ensure that the parent directory of `path` exists, creating it if needed.
 pub fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create directory '{}'", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
     }
     Ok(())
 }

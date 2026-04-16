@@ -88,7 +88,13 @@ async fn main() -> Result<()> {
             auth::cmd_whoami(api_id, session_path).await?;
         }
 
-        Commands::Download { link, peer, msg, file, out } => {
+        Commands::Download {
+            link,
+            peer,
+            msg,
+            file,
+            out,
+        } => {
             download::cmd_download(
                 api_id,
                 session_path,

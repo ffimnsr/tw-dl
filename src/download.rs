@@ -8,9 +8,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
-use tokio::io::AsyncBufReadExt;
 
 use crate::link::{parse_link, ParsedLink};
 
@@ -25,11 +25,7 @@ pub struct DownloadArgs {
 }
 
 /// Entry-point for the `download` subcommand.
-pub async fn cmd_download(
-    api_id: i32,
-    session_path: PathBuf,
-    args: DownloadArgs,
-) -> Result<()> {
+pub async fn cmd_download(api_id: i32, session_path: PathBuf, args: DownloadArgs) -> Result<()> {
     let client = crate::auth::build_client(api_id, &session_path).await?;
 
     if !client.is_authorized().await? {
@@ -40,7 +36,7 @@ pub async fn cmd_download(
         // Batch mode: read links from file, one per line
         let file = fs::File::open(list_path)
             .await
-            .with_context(|| format!("Cannot open file list '{}'" , list_path.display()))?;
+            .with_context(|| format!("Cannot open file list '{}'", list_path.display()))?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
         let mut index: usize = 0;
@@ -107,9 +103,7 @@ fn resolve_peer_msg(args: &DownloadArgs) -> Result<(PeerSpec, i32)> {
 
     match parse_link(link_str)? {
         ParsedLink::Username { username, msg_id } => Ok((PeerSpec::Username(username), msg_id)),
-        ParsedLink::Channel { channel_id, msg_id } => {
-            Ok((PeerSpec::ChannelId(channel_id), msg_id))
-        }
+        ParsedLink::Channel { channel_id, msg_id } => Ok((PeerSpec::ChannelId(channel_id), msg_id)),
     }
 }
 
@@ -122,14 +116,12 @@ async fn fetch_message(client: &Client, spec: &PeerSpec, msg_id: i32) -> Result<
                 .await
                 .with_context(|| format!("Failed to resolve username '{}'", username))?
                 .with_context(|| format!("Username '{}' not found", username))?;
-            peer.to_ref()
-                .await
-                .with_context(|| format!("Could not obtain a usable reference for '@{}'", username))?
+            peer.to_ref().await.with_context(|| {
+                format!("Could not obtain a usable reference for '@{}'", username)
+            })?
         }
 
-        PeerSpec::ChannelId(channel_id) => {
-            find_peer_ref_by_id(client, *channel_id).await?
-        }
+        PeerSpec::ChannelId(channel_id) => find_peer_ref_by_id(client, *channel_id).await?,
     };
 
     let mut messages = client
@@ -275,10 +267,8 @@ async fn stream_download<D: Downloadable>(
     } else {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] {bytes} downloaded",
-            )
-            .unwrap(),
+            ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {bytes} downloaded")
+                .unwrap(),
         );
         pb
     };
@@ -360,4 +350,3 @@ mod tests {
         assert_eq!(mime_to_ext("unknown/type"), "");
     }
 }
-

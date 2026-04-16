@@ -51,17 +51,15 @@ pub async fn cmd_login(api_id: i32, api_hash: &str, session_path: PathBuf) -> Re
 
     match client.sign_in(&login_token, &code).await {
         Ok(user) => {
-            println!(
-                "Signed in as {} (id: {})",
-                display_name(&user),
-                user.id()
-            );
+            println!("Signed in as {} (id: {})", display_name(&user), user.id());
         }
         Err(SignInError::PasswordRequired(password_token)) => {
             let hint = password_token.hint().unwrap_or("none");
-            let password =
-                rpassword::prompt_password(format!("Two-factor authentication password (hint: {}): ", hint))
-                    .context("Failed to read password")?;
+            let password = rpassword::prompt_password(format!(
+                "Two-factor authentication password (hint: {}): ",
+                hint
+            ))
+            .context("Failed to read password")?;
             client
                 .check_password(password_token, password.trim())
                 .await
