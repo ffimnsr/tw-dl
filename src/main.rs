@@ -1,4 +1,5 @@
 mod auth;
+mod config;
 mod download;
 mod link;
 mod session;
@@ -14,7 +15,8 @@ use std::path::PathBuf;
     about = "Download Telegram media via MTProto",
     long_about = "A CLI tool for downloading videos, documents and photos from Telegram \
                   channels and groups that your account has access to.\n\n\
-                  Configure TELEGRAM_API_ID and TELEGRAM_API_HASH in a .env file or your shell environment before use."
+                  Configure TELEGRAM_API_ID and TELEGRAM_API_HASH in environment variables, \
+                  a local .env file, or ~/.config/tw-dl/config.toml before use."
 )]
 struct Cli {
     /// Path to the session file (default: ~/.config/tw-dl/session)
@@ -27,8 +29,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize ~/.config/tw-dl/config.toml with Telegram API credentials.
+    Init {
+        /// Overwrite an existing config.toml file.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Interactive login: authenticate with your Telegram account and save the session.
     Login,
+
+    /// Remove the saved Telegram session.
+    Logout,
 
     /// Print the currently authenticated user's info (JSON).
     Whoami,
@@ -42,14 +54,20 @@ enum Commands {
     ///   tw-dl download --file links.txt --out ./videos
     Download {
         /// Telegram message link (https://t.me/... or https://t.me/c/...)
+        #[arg(conflicts_with_all = ["peer", "msg", "file"])]
         link: Option<String>,
 
         /// Peer username or numeric channel id (alternative to a link)
-        #[arg(long, value_name = "USERNAME_OR_ID")]
+        #[arg(
+            long,
+            value_name = "USERNAME_OR_ID",
+            requires = "msg",
+            conflicts_with = "file"
+        )]
         peer: Option<String>,
 
         /// Message id (used together with --peer)
-        #[arg(long, value_name = "ID")]
+        #[arg(long, value_name = "ID", requires = "peer", conflicts_with = "file")]
         msg: Option<i32>,
 
         /// File containing one Telegram link per line (batch download)
@@ -70,21 +88,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let session_path = session::resolve_session_path(cli.session_path)?;
-
-    let api_id: i32 = std::env::var("TELEGRAM_API_ID")
-        .context("TELEGRAM_API_ID environment variable is not set")?
-        .parse()
-        .context("TELEGRAM_API_ID must be a valid integer")?;
-
-    let api_hash = std::env::var("TELEGRAM_API_HASH")
-        .context("TELEGRAM_API_HASH environment variable is not set")?;
+    let config_path = session::resolve_config_path()?;
 
     match cli.command {
+        Commands::Init { force } => {
+            config::cmd_init(config_path, force)?;
+        }
         Commands::Login => {
+            let api_id = load_api_id(&config_path)?;
+            let api_hash = load_api_hash(&config_path)?;
             auth::cmd_login(api_id, &api_hash, session_path).await?;
+        }
+        Commands::Logout => {
+            auth::cmd_logout(&session_path)?;
         }
 
         Commands::Whoami => {
+            let api_id = load_api_id(&config_path)?;
             auth::cmd_whoami(api_id, session_path).await?;
         }
 
@@ -95,6 +115,7 @@ async fn main() -> Result<()> {
             file,
             out,
         } => {
+            let api_id = load_api_id(&config_path)?;
             download::cmd_download(
                 api_id,
                 session_path,
@@ -111,4 +132,32 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn load_api_id(config_path: &std::path::Path) -> Result<i32> {
+    if let Ok(value) = std::env::var("TELEGRAM_API_ID") {
+        return value
+            .parse()
+            .context("TELEGRAM_API_ID must be a valid integer");
+    }
+
+    let config = config::load_config(config_path)?;
+    config
+        .map(|cfg| cfg.telegram_api_id)
+        .context(
+            "TELEGRAM_API_ID is not set and no telegram_api_id was found in ~/.config/tw-dl/config.toml",
+        )
+}
+
+fn load_api_hash(config_path: &std::path::Path) -> Result<String> {
+    if let Ok(value) = std::env::var("TELEGRAM_API_HASH") {
+        return Ok(value);
+    }
+
+    let config = config::load_config(config_path)?;
+    config
+        .map(|cfg| cfg.telegram_api_hash)
+        .context(
+            "TELEGRAM_API_HASH is not set and no telegram_api_hash was found in ~/.config/tw-dl/config.toml",
+        )
 }

@@ -30,3 +30,6 @@ downloads/
 
 .env
 !.env.example
+
+/*.md
+!README.md

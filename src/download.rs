@@ -8,6 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::fs::OpenOptions;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
@@ -40,6 +41,8 @@ pub async fn cmd_download(api_id: i32, session_path: PathBuf, args: DownloadArgs
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
         let mut index: usize = 0;
+        let mut success_count: usize = 0;
+        let mut failure_count: usize = 0;
         while let Some(line) = lines.next_line().await? {
             let link = line.trim().to_string();
             // Skip blank lines and comments
@@ -56,9 +59,23 @@ pub async fn cmd_download(api_id: i32, session_path: PathBuf, args: DownloadArgs
                 file_list: None,
             };
             match download_one(&client, &single).await {
-                Ok(result) => println!("{}", serde_json::to_string_pretty(&result)?),
-                Err(e) => eprintln!("[{}] ERROR {}: {:#}", index, link, e),
+                Ok(result) => {
+                    success_count += 1;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                Err(e) => {
+                    failure_count += 1;
+                    eprintln!("[{}] ERROR {}: {:#}", index, link, e);
+                }
             }
+        }
+
+        if failure_count > 0 {
+            bail!(
+                "Batch download completed with {} succeeded and {} failed.",
+                success_count,
+                failure_count
+            );
         }
     } else {
         // Single download
@@ -273,29 +290,75 @@ async fn stream_download<D: Downloadable>(
         pb
     };
 
-    let mut file = fs::File::create(out_path)
+    if fs::try_exists(out_path)
         .await
-        .with_context(|| format!("Failed to create file '{}'", out_path.display()))?;
-
-    let mut download = client.iter_download(downloadable);
-    while let Some(chunk) = download
-        .next()
-        .await
-        .map_err(|e| anyhow::anyhow!("Download error: {}", e))?
+        .with_context(|| format!("Failed to inspect '{}'", out_path.display()))?
     {
-        file.write_all(&chunk)
-            .await
-            .with_context(|| format!("Failed to write to '{}'", out_path.display()))?;
-        pb.inc(chunk.len() as u64);
+        bail!(
+            "Refusing to overwrite existing file '{}'. Remove it first or choose a different output directory.",
+            out_path.display()
+        );
     }
 
-    file.flush()
+    let temp_path = partial_download_path(out_path);
+    if fs::try_exists(&temp_path)
         .await
-        .with_context(|| format!("Failed to flush '{}'", out_path.display()))?;
+        .with_context(|| format!("Failed to inspect '{}'", temp_path.display()))?
+    {
+        bail!(
+            "Temporary download file '{}' already exists. Remove it before retrying.",
+            temp_path.display()
+        );
+    }
 
-    pb.finish_with_message(format!("Saved to '{}'", out_path.display()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .await
+        .with_context(|| format!("Failed to create file '{}'", temp_path.display()))?;
 
-    Ok(())
+    let download_result: Result<()> = async {
+        let mut download = client.iter_download(downloadable);
+        while let Some(chunk) = download
+            .next()
+            .await
+            .map_err(|e| anyhow::anyhow!("Download error: {}", e))?
+        {
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("Failed to write to '{}'", temp_path.display()))?;
+            pb.inc(chunk.len() as u64);
+        }
+
+        file.flush()
+            .await
+            .with_context(|| format!("Failed to flush '{}'", temp_path.display()))?;
+
+        Ok(())
+    }
+    .await;
+
+    match download_result {
+        Ok(()) => {
+            drop(file);
+            fs::rename(&temp_path, out_path).await.with_context(|| {
+                format!(
+                    "Failed to move completed download from '{}' to '{}'",
+                    temp_path.display(),
+                    out_path.display()
+                )
+            })?;
+            pb.finish_with_message(format!("Saved to '{}'", out_path.display()));
+            Ok(())
+        }
+        Err(error) => {
+            pb.abandon_with_message(format!("Failed to save '{}'", out_path.display()));
+            drop(file);
+            let _ = fs::remove_file(&temp_path).await;
+            Err(error)
+        }
+    }
 }
 
 // ── utilities ─────────────────────────────────────────────────────────────────
@@ -307,6 +370,15 @@ fn sanitize_filename(name: &str) -> String {
             c => c,
         })
         .collect()
+}
+
+fn partial_download_path(out_path: &Path) -> PathBuf {
+    let mut filename = out_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    filename.push(".part");
+    out_path.with_file_name(filename)
 }
 
 fn mime_to_ext(mime: &str) -> &str {
@@ -348,5 +420,14 @@ mod tests {
         assert_eq!(mime_to_ext("video/mp4"), ".mp4");
         assert_eq!(mime_to_ext("audio/mpeg"), ".mp3");
         assert_eq!(mime_to_ext("unknown/type"), "");
+    }
+
+    #[test]
+    fn test_partial_download_path() {
+        let path = Path::new("/tmp/video.mp4");
+        assert_eq!(
+            partial_download_path(path),
+            PathBuf::from("/tmp/video.mp4.part")
+        );
     }
 }

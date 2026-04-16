@@ -1,5 +1,16 @@
 use anyhow::{bail, Result};
 use regex::Regex;
+use std::sync::OnceLock;
+
+fn private_link_regex() -> &'static Regex {
+    static PRIVATE_RE: OnceLock<Regex> = OnceLock::new();
+    PRIVATE_RE.get_or_init(|| Regex::new(r"^t\.me/c/(\d+)/(\d+)$").unwrap())
+}
+
+fn public_link_regex() -> &'static Regex {
+    static PUBLIC_RE: OnceLock<Regex> = OnceLock::new();
+    PUBLIC_RE.get_or_init(|| Regex::new(r"^t\.me/([\w\d_]+)/(\d+)$").unwrap())
+}
 
 /// A parsed Telegram message link.
 #[derive(Debug, Clone)]
@@ -26,16 +37,14 @@ pub fn parse_link(input: &str) -> Result<ParsedLink> {
         .unwrap_or(input);
 
     // t.me/c/<channel_id>/<msg_id>  (private/supergroup)
-    let private_re = Regex::new(r"^t\.me/c/(\d+)/(\d+)$").unwrap();
-    if let Some(caps) = private_re.captures(input) {
+    if let Some(caps) = private_link_regex().captures(input) {
         let channel_id: i64 = caps[1].parse()?;
         let msg_id: i32 = caps[2].parse()?;
         return Ok(ParsedLink::Channel { channel_id, msg_id });
     }
 
     // t.me/<username>/<msg_id>  (public)
-    let public_re = Regex::new(r"^t\.me/([\w\d_]+)/(\d+)$").unwrap();
-    if let Some(caps) = public_re.captures(input) {
+    if let Some(caps) = public_link_regex().captures(input) {
         let username = caps[1].to_string();
         let msg_id: i32 = caps[2].parse()?;
         return Ok(ParsedLink::Username { username, msg_id });

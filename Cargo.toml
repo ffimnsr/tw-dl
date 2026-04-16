@@ -13,14 +13,15 @@ path = "src/main.rs"
 [dependencies]
 grammers-client = "0.9"
 grammers-session = "0.9"
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
-indicatif = "0.17"
+clap = { version = "4.6.1", features = ["derive"] }
+tokio = { version = "1.52.0", features = ["full"] }
+indicatif = "0.18.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-dirs = "5"
+dirs = "6.0.0"
 anyhow = "1"
 rpassword = "7"
 regex = "1"
 tokio-util = { version = "0.7", features = ["io"] }
 dotenvy = "0.15"
+toml = "1.1.2"

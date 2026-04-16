@@ -1,4 +1,4 @@
-# tw-dl
+# tw-dl (Telegram Web Downloader)
 
 `tw-dl` is a Rust CLI for downloading Telegram media through MTProto.
 

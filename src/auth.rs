@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use grammers_client::{Client, SenderPool, SignInError};
 use grammers_session::storages::SqliteSession;
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Build a Telegram `Client` connected to the network, loading or creating a
@@ -10,8 +12,9 @@ use std::sync::Arc;
 ///
 /// Also spawns the network runner task on the Tokio runtime (a background task
 /// that processes all low-level MTProto I/O).
-pub async fn build_client(api_id: i32, session_path: &PathBuf) -> Result<Client> {
+pub async fn build_client(api_id: i32, session_path: &PathBuf) -> Result<AppClient> {
     crate::session::ensure_parent_dir(session_path)?;
+    let session_lock = SessionLock::acquire(session_path)?;
 
     let session = Arc::new(
         SqliteSession::open(session_path)
@@ -26,7 +29,10 @@ pub async fn build_client(api_id: i32, session_path: &PathBuf) -> Result<Client>
     // dropped or when the Tokio runtime exits.
     tokio::spawn(runner.run());
 
-    Ok(client)
+    Ok(AppClient {
+        client,
+        _session_lock: session_lock,
+    })
 }
 
 /// Interactive `login` command.
@@ -100,6 +106,16 @@ pub async fn cmd_whoami(api_id: i32, session_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+pub fn cmd_logout(session_path: &Path) -> Result<()> {
+    if crate::session::clear_session(session_path)? {
+        println!("Cleared session at '{}'.", session_path.display());
+    } else {
+        println!("No session found at '{}'.", session_path.display());
+    }
+
+    Ok(())
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn prompt(message: &str) -> Result<String> {
@@ -128,5 +144,51 @@ fn display_name(user: &grammers_client::peer::User) -> String {
             .username()
             .map(|u| format!("@{}", u))
             .unwrap_or_else(|| format!("id:{}", user.id().bot_api_dialog_id())),
+    }
+}
+
+pub struct AppClient {
+    client: Client,
+    _session_lock: SessionLock,
+}
+
+impl Deref for AppClient {
+    type Target = Client;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+struct SessionLock {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl SessionLock {
+    fn acquire(session_path: &Path) -> Result<Self> {
+        let lock_path = session_path.with_extension("lock");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "Session '{}' is already in use by another tw-dl process. Wait for it to finish or remove stale lock file '{}'.",
+                    session_path.display(),
+                    lock_path.display()
+                )
+            })?;
+
+        Ok(Self {
+            path: lock_path,
+            _file: file,
+        })
+    }
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
