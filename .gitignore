@@ -28,6 +28,7 @@ target
 # Default downloads directory created by tw-dl
 downloads/
 
+.codex
 .env
 !.env.example
 

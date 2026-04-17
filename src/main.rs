@@ -1,14 +1,9 @@
-mod auth;
-mod config;
-mod doctor;
-mod download;
-mod link;
-mod session;
-
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Generator, Shell};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tw_dl::{auth, config, doctor, download, manifest, output, session};
 
 #[derive(Parser)]
 #[command(
@@ -37,10 +32,60 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 1800)]
     stale_lock_age_secs: u64,
 
+    /// Append structured JSON logs to this file.
+    #[arg(long, global = true, value_name = "FILE")]
+    log_file: Option<PathBuf>,
+
+    /// Emit machine-readable JSON output.
+    #[arg(long, global = true, conflicts_with = "human")]
+    json: bool,
+
+    /// Emit human-readable output.
+    #[arg(long, global = true, conflicts_with = "json")]
+    human: bool,
+
+    /// Reduce non-essential stderr output.
+    #[arg(long, global = true)]
+    quiet: bool,
+
+    /// Disable progress bars during downloads.
+    #[arg(long, global = true)]
+    no_progress: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BatchInputFormatArg {
+    Auto,
+    Text,
+    Csv,
+    Jsonl,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MediaVariantArg {
+    Auto,
+    LargestPhoto,
+    OriginalDocument,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputLayoutArg {
+    Flat,
+    Chat,
+    Date,
+    MediaType,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CaptionSidecarArg {
+    Txt,
+    Json,
+}
+
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize ~/.config/tw-dl/config.toml with Telegram API credentials.
@@ -93,7 +138,7 @@ enum Commands {
         #[arg(long, value_name = "ID", requires = "peer", conflicts_with = "file")]
         msg: Option<i32>,
 
-        /// File containing one Telegram link per line (batch download)
+        /// File containing batch input. Use "-" to read from stdin.
         #[arg(long, short = 'f', value_name = "FILE", conflicts_with_all = ["link", "peer", "msg"])]
         file: Option<PathBuf>,
 
@@ -129,8 +174,32 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         jobs: usize,
 
-        /// Path to the batch checkpoint manifest (JSONL). Defaults next to --file.
-        #[arg(long, value_name = "FILE", requires = "file")]
+        /// Batch input format for --file or stdin.
+        #[arg(long, value_enum, default_value_t = BatchInputFormatArg::Auto)]
+        input_format: BatchInputFormatArg,
+
+        /// Continue processing remaining batch items after a failure.
+        #[arg(long, conflicts_with = "fail_fast")]
+        continue_on_error: bool,
+
+        /// Stop scheduling new batch items after the first failure.
+        #[arg(long, conflicts_with = "continue_on_error")]
+        fail_fast: bool,
+
+        /// Stop scheduling new batch items after this many failures.
+        #[arg(long, value_name = "N")]
+        max_failures: Option<usize>,
+
+        /// Start processing at this 1-based input line number.
+        #[arg(long, value_name = "N")]
+        from_line: Option<usize>,
+
+        /// Stop processing after this 1-based input line number.
+        #[arg(long, value_name = "N")]
+        to_line: Option<usize>,
+
+        /// Path to the batch checkpoint manifest (JSONL). Defaults next to --file or ./stdin.checkpoint.jsonl for stdin.
+        #[arg(long, value_name = "FILE")]
         checkpoint: Option<PathBuf>,
 
         /// Preview what would be downloaded without writing files.
@@ -140,6 +209,54 @@ enum Commands {
         /// Replay only failed links from a previous checkpoint/manifest JSONL file.
         #[arg(long, value_name = "FILE", conflicts_with_all = ["link", "peer", "msg", "file"])]
         retry_from: Option<PathBuf>,
+
+        /// Run this shell command after each successful item, with JSON in `TW_DL_EVENT_JSON` and stdin.
+        #[arg(long, value_name = "COMMAND")]
+        success_hook: Option<String>,
+
+        /// Run this shell command after each failed item, with JSON in `TW_DL_EVENT_JSON` and stdin.
+        #[arg(long, value_name = "COMMAND")]
+        failure_hook: Option<String>,
+
+        /// Append processed item metadata to this JSONL archive file.
+        #[arg(long, value_name = "FILE")]
+        archive: Option<PathBuf>,
+
+        /// Media selection strategy for supported messages and grouped media.
+        #[arg(long, value_enum, default_value_t = MediaVariantArg::Auto)]
+        media_variant: MediaVariantArg,
+
+        /// File naming template, for example "{chat}_{msg_id}_{filename}".
+        #[arg(long, value_name = "TEMPLATE")]
+        name_template: Option<String>,
+
+        /// Organize downloads into subdirectories by chat, date, or media type.
+        #[arg(long, value_enum, default_value_t = OutputLayoutArg::Flat)]
+        output_layout: OutputLayoutArg,
+
+        /// Suffix the filename when the destination already exists.
+        #[arg(long, conflicts_with_all = ["skip_existing", "overwrite", "resume"])]
+        suffix_existing: bool,
+
+        /// Write a JSON metadata sidecar next to each downloaded item.
+        #[arg(long)]
+        metadata_sidecar: bool,
+
+        /// Write the message caption as a sidecar file.
+        #[arg(long, value_enum, value_name = "FORMAT")]
+        caption_sidecar: Option<CaptionSidecarArg>,
+
+        /// Compute a SHA-256 hash for each completed download.
+        #[arg(long)]
+        hash: bool,
+
+        /// Redownload from scratch if the final file size does not match the expected Telegram size.
+        #[arg(long)]
+        redownload_on_mismatch: bool,
+
+        /// Print only the output path(s) for successful or planned items.
+        #[arg(long)]
+        print_path_only: bool,
 
         /// Number of parallel chunk workers for large-file downloads.
         #[arg(long, default_value_t = 1)]
@@ -179,6 +296,38 @@ enum Commands {
 
     /// Validate config, session, and authorization state.
     Doctor,
+
+    /// Generate shell completion scripts.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+
+    /// Import or export checkpoint/manifest files.
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManifestCommands {
+    /// Export a checkpoint or manifest to JSON or JSONL.
+    Export {
+        #[arg(long, value_name = "FILE")]
+        input: PathBuf,
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+
+    /// Import a JSON or JSONL manifest into normalized JSONL format.
+    Import {
+        #[arg(long, value_name = "FILE")]
+        input: PathBuf,
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -198,6 +347,19 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    output::init_output(
+        output::OutputSettings {
+            mode: if cli.human {
+                output::OutputMode::Human
+            } else {
+                let _ = cli.json;
+                output::OutputMode::Json
+            },
+            quiet: cli.quiet,
+            no_progress: cli.no_progress,
+        },
+        cli.log_file.clone(),
+    )?;
     let session_path = session::resolve_session_path(cli.session_path)?;
     let config_path = session::resolve_config_path()?;
     let session_options = auth::SessionOptions {
@@ -242,9 +404,27 @@ async fn run(cli: Cli) -> Result<()> {
             retry_delay_ms,
             max_retry_delay_ms,
             jobs,
+            input_format,
+            continue_on_error,
+            fail_fast,
+            max_failures,
+            from_line,
+            to_line,
             checkpoint,
             dry_run,
             retry_from,
+            success_hook,
+            failure_hook,
+            archive,
+            media_variant,
+            name_template,
+            output_layout,
+            suffix_existing,
+            metadata_sidecar,
+            caption_sidecar,
+            hash,
+            redownload_on_mismatch,
+            print_path_only,
             parallel_chunks,
             keep_partial,
             request_timeout_ms,
@@ -266,6 +446,7 @@ async fn run(cli: Cli) -> Result<()> {
                         skip_existing,
                         overwrite,
                         resume,
+                        suffix_existing,
                     ),
                     retry: download::RetryConfig::new(
                         retries,
@@ -273,9 +454,50 @@ async fn run(cli: Cli) -> Result<()> {
                         std::time::Duration::from_millis(max_retry_delay_ms),
                     )?,
                     jobs,
+                    input_format: match input_format {
+                        BatchInputFormatArg::Auto => download::BatchInputFormat::Auto,
+                        BatchInputFormatArg::Text => download::BatchInputFormat::Text,
+                        BatchInputFormatArg::Csv => download::BatchInputFormat::Csv,
+                        BatchInputFormatArg::Jsonl => download::BatchInputFormat::Jsonl,
+                    },
+                    failure_mode: if fail_fast {
+                        download::BatchFailureMode::FailFast
+                    } else {
+                        let _ = continue_on_error;
+                        download::BatchFailureMode::ContinueOnError
+                    },
+                    max_failures,
+                    from_line,
+                    to_line,
                     checkpoint,
                     dry_run,
                     retry_from,
+                    log_file: cli.log_file.clone(),
+                    success_hook,
+                    failure_hook,
+                    archive_path: archive,
+                    media_variant: match media_variant {
+                        MediaVariantArg::Auto => download::MediaVariant::Auto,
+                        MediaVariantArg::LargestPhoto => download::MediaVariant::LargestPhoto,
+                        MediaVariantArg::OriginalDocument => {
+                            download::MediaVariant::OriginalDocument
+                        }
+                    },
+                    name_template,
+                    output_layout: match output_layout {
+                        OutputLayoutArg::Flat => download::OutputLayout::Flat,
+                        OutputLayoutArg::Chat => download::OutputLayout::Chat,
+                        OutputLayoutArg::Date => download::OutputLayout::Date,
+                        OutputLayoutArg::MediaType => download::OutputLayout::MediaType,
+                    },
+                    metadata_sidecar,
+                    caption_sidecar: caption_sidecar.map(|format| match format {
+                        CaptionSidecarArg::Txt => download::CaptionSidecarFormat::Txt,
+                        CaptionSidecarArg::Json => download::CaptionSidecarFormat::Json,
+                    }),
+                    hash,
+                    redownload_on_mismatch,
+                    print_path_only,
                     parallel_chunks,
                     keep_partial,
                     request_timeout: request_timeout_ms.map(std::time::Duration::from_millis),
@@ -302,9 +524,39 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Doctor => {
             doctor::cmd_doctor(config_path, session_path).await?;
         }
+        Commands::Completions { shell } => {
+            print_completions(shell, &mut Cli::command());
+        }
+        Commands::Manifest { command } => match command {
+            ManifestCommands::Export { input, output } => {
+                manifest::export_manifest(&input, &output).await?;
+                let records = manifest::read_manifest_records(&output).await?;
+                output::write_command_output(
+                    "manifest-export",
+                    manifest::manifest_export_result(&input, &output, records.len()),
+                )?;
+            }
+            ManifestCommands::Import { input, output } => {
+                manifest::import_manifest(&input, &output).await?;
+                let records = manifest::read_manifest_records(&output).await?;
+                output::write_command_output(
+                    "manifest-import",
+                    manifest::manifest_export_result(&input, &output, records.len()),
+                )?;
+            }
+        },
     }
 
     Ok(())
+}
+
+fn print_completions<G: Generator>(generator: G, cmd: &mut clap::Command) {
+    generate(
+        generator,
+        cmd,
+        cmd.get_name().to_string(),
+        &mut std::io::stdout(),
+    );
 }
 
 fn load_api_id(config_path: &std::path::Path) -> Result<i32> {

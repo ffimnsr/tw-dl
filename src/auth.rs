@@ -125,15 +125,18 @@ pub async fn cmd_whoami(
         .await
         .context("Failed to fetch current user")?;
 
-    let output = serde_json::json!({
-        "id": me.id().bot_api_dialog_id(),
-        "username": me.username(),
-        "first_name": me.first_name(),
-        "last_name": me.last_name(),
-        "phone": me.phone(),
-    });
+    let output = crate::output::command_output(
+        "whoami",
+        serde_json::json!({
+            "id": me.id().bot_api_dialog_id(),
+            "username": me.username(),
+            "first_name": me.first_name(),
+            "last_name": me.last_name(),
+            "phone": me.phone(),
+        }),
+    );
 
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    crate::output::write_command_output("whoami", output["data"].clone())?;
     Ok(())
 }
 

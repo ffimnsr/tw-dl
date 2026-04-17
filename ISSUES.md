@@ -20,30 +20,30 @@ The list is intentionally descriptive so it can serve as both a roadmap and an i
 ## Batch Downloading
 
 - [x] Add `--jobs <N>` for concurrent batch downloads.
-- [ ] Add explicit `--continue-on-error` and `--fail-fast` modes so batch behavior is intentional instead of implicit.
-- [ ] Add `--max-failures <N>` to stop a batch after too many failed items.
-- [ ] Add `--from-line` and `--to-line` to process only part of a large input file.
-- [ ] Accept CSV or JSONL input in addition to plain text links.
-- [ ] Support stdin input so users can pipe links directly into the downloader.
+- [x] Add explicit `--continue-on-error` and `--fail-fast` modes so batch behavior is intentional instead of implicit.
+- [x] Add `--max-failures <N>` to stop a batch after too many failed items.
+- [x] Add `--from-line` and `--to-line` to process only part of a large input file.
+- [x] Accept CSV or JSONL input in addition to plain text links.
+- [x] Support stdin input so users can pipe links directly into the downloader.
 - [x] Write a JSONL-style checkpoint/result manifest for every batch item.
-- [ ] Add input deduplication so the same message is not downloaded twice in one run.
+- [x] Add input deduplication so the same message is not downloaded twice in one run.
 - [x] Add explicit file collision policies with `--skip-existing`, `--overwrite`, and `--resume`.
 - [x] Add a way to rerun only failures from a previous checkpoint or manifest file.
 
 ## Download Behavior
 
-- [ ] Support downloading multiple media items from albums or grouped messages.
-- [ ] Support choosing media variants, such as largest photo only or original document only.
-- [ ] Add file naming templates like `--name-template "{chat}_{msg_id}_{filename}"`.
-- [ ] Support output subdirectories by chat, date, or media type.
-- [ ] Add filename collision suffixing as an alternative to skip, overwrite, or resume.
-- [ ] Preserve Telegram message metadata in a sidecar file: message id, chat, sender, date, caption, mime type, and source link.
-- [ ] Optionally write captions to `.txt` or `.json` sidecars.
-- [ ] Add content hashing during or after download to support integrity checks and dedupe workflows.
-- [ ] Add size verification or redownload-on-mismatch when a transfer looks truncated.
-- [ ] Add `--print-path-only` for scripting use cases.
-- [ ] Add `--no-progress` and `--quiet` modes for CI and automation.
-- [ ] Add consistent `--json` and human-readable output modes across commands.
+- [x] Support downloading multiple media items from albums or grouped messages.
+- [x] Support choosing media variants, such as largest photo only or original document only.
+- [x] Add file naming templates like `--name-template "{chat}_{msg_id}_{filename}"`.
+- [x] Support output subdirectories by chat, date, or media type.
+- [x] Add filename collision suffixing as an alternative to skip, overwrite, or resume.
+- [x] Preserve Telegram message metadata in a sidecar file: message id, chat, sender, date, caption, mime type, and source link.
+- [x] Optionally write captions to `.txt` or `.json` sidecars.
+- [x] Add content hashing during or after download to support integrity checks and dedupe workflows.
+- [x] Add size verification or redownload-on-mismatch when a transfer looks truncated.
+- [x] Add `--print-path-only` for scripting use cases.
+- [x] Add `--no-progress` and `--quiet` modes for CI and automation.
+- [x] Add consistent `--json` and human-readable output modes across commands.
 
 ## Discovery and Inspection
 
@@ -91,14 +91,14 @@ The list is intentionally descriptive so it can serve as both a roadmap and an i
 
 ## Output and Integration
 
-- [ ] Add shell completion generation for Bash, Zsh, Fish, and PowerShell.
-- [ ] Stabilize and document the JSON output schema for scripting and integrations.
-- [ ] Add `--log-file` and structured logs for long-running jobs.
-- [ ] Add webhook support or success/failure hooks for automation.
-- [ ] Add archive mode that stores downloaded item metadata in SQLite or JSON.
-- [ ] Add export/import support for manifests and checkpoints.
-- [ ] Emit canonical source links in manifests and output where possible.
-- [ ] Split reusable logic into a library crate so other Rust tools can integrate with `tw-dl`.
+- [x] Add shell completion generation for Bash, Zsh, Fish, and PowerShell.
+- [x] Stabilize and document the JSON output schema for scripting and integrations.
+- [x] Add `--log-file` and structured logs for long-running jobs.
+- [x] Add webhook support or success/failure hooks for automation.
+- [x] Add archive mode that stores downloaded item metadata in SQLite or JSON.
+- [x] Add export/import support for manifests and checkpoints.
+- [x] Emit canonical source links in manifests and output where possible.
+- [x] Split reusable logic into a library crate so other Rust tools can integrate with `tw-dl`.
 
 ## Safety and UX
 

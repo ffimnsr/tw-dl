@@ -6,27 +6,34 @@ use grammers_client::Client;
 use grammers_session::types::PeerRef;
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::io::IsTerminal;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::fs;
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{
+    self, AsyncBufReadExt, AsyncRead, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter,
+};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
 use crate::link::{parse_link, ParsedLink};
+use crate::manifest::{
+    append_manifest_record, open_manifest_writer, read_manifest_records, ManifestRecord,
+};
 
 const DOWNLOAD_CHUNK_SIZE: i32 = 128 * 1024;
 const MAX_PARALLEL_CHUNK_SIZE: i32 = 512 * 1024;
 const PARALLEL_DOWNLOAD_THRESHOLD: u64 = 10 * 1024 * 1024;
+const GROUP_FETCH_WINDOW: i32 = 64;
 
 /// Options for the `download` command.
 pub struct DownloadArgs {
@@ -38,9 +45,26 @@ pub struct DownloadArgs {
     pub collision: CollisionPolicy,
     pub retry: RetryConfig,
     pub jobs: usize,
+    pub input_format: BatchInputFormat,
+    pub failure_mode: BatchFailureMode,
+    pub max_failures: Option<usize>,
+    pub from_line: Option<usize>,
+    pub to_line: Option<usize>,
     pub checkpoint: Option<PathBuf>,
     pub dry_run: bool,
     pub retry_from: Option<PathBuf>,
+    pub log_file: Option<PathBuf>,
+    pub success_hook: Option<String>,
+    pub failure_hook: Option<String>,
+    pub archive_path: Option<PathBuf>,
+    pub media_variant: MediaVariant,
+    pub name_template: Option<String>,
+    pub output_layout: OutputLayout,
+    pub metadata_sidecar: bool,
+    pub caption_sidecar: Option<CaptionSidecarFormat>,
+    pub hash: bool,
+    pub redownload_on_mismatch: bool,
+    pub print_path_only: bool,
     pub parallel_chunks: usize,
     pub keep_partial: bool,
     pub request_timeout: Option<Duration>,
@@ -56,25 +80,68 @@ pub struct InspectArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchInputFormat {
+    Auto,
+    Text,
+    Csv,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchFailureMode {
+    ContinueOnError,
+    FailFast,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollisionPolicy {
     Error,
     SkipExisting,
     Overwrite,
     Resume,
+    SuffixExisting,
 }
 
 impl CollisionPolicy {
-    pub fn from_flags(skip_existing: bool, overwrite: bool, resume: bool) -> Self {
+    pub fn from_flags(
+        skip_existing: bool,
+        overwrite: bool,
+        resume: bool,
+        suffix_existing: bool,
+    ) -> Self {
         if skip_existing {
             Self::SkipExisting
         } else if overwrite {
             Self::Overwrite
         } else if resume {
             Self::Resume
+        } else if suffix_existing {
+            Self::SuffixExisting
         } else {
             Self::Error
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaVariant {
+    Auto,
+    LargestPhoto,
+    OriginalDocument,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputLayout {
+    Flat,
+    Chat,
+    Date,
+    MediaType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptionSidecarFormat {
+    Txt,
+    Json,
 }
 
 #[derive(Default)]
@@ -242,13 +309,54 @@ pub async fn cmd_download(
     if args.file_list.is_some() && args.retry_from.is_some() {
         bail!("--file and --retry-from cannot be used together");
     }
+    if matches!(args.failure_mode, BatchFailureMode::FailFast) && args.max_failures == Some(0) {
+        bail!("--max-failures must be at least 1 when provided");
+    }
+    if let Some(0) = args.max_failures {
+        bail!("--max-failures must be at least 1");
+    }
+    if let (Some(from_line), Some(to_line)) = (args.from_line, args.to_line) {
+        if from_line > to_line {
+            bail!("--from-line must be less than or equal to --to-line");
+        }
+    }
+    if args.retry_from.is_some() && (args.from_line.is_some() || args.to_line.is_some()) {
+        bail!("--from-line and --to-line can only be used with --file or stdin batch input");
+    }
+    if args.retry_from.is_some() && !matches!(args.input_format, BatchInputFormat::Auto) {
+        bail!("--input-format applies to --file or stdin batch input, not --retry-from");
+    }
 
     let client = Arc::new(ResilientClient::new(api_id, session_path, session_options).await?);
     ensure_authorized(&client).await?;
     let caches = Arc::new(DownloadCaches::default());
     let timeouts = TimeoutConfig::from_args(&args);
+    let batch_source = resolve_batch_source(&args)?;
+    let is_batch_mode = batch_source.is_some() || args.retry_from.is_some();
+    let _ = &args.log_file;
+
+    if !is_batch_mode {
+        if args.max_failures.is_some() {
+            bail!("--max-failures can only be used with --file, stdin, or --retry-from");
+        }
+        if args.from_line.is_some() || args.to_line.is_some() {
+            bail!("--from-line and --to-line can only be used with --file or stdin batch input");
+        }
+        if !matches!(args.failure_mode, BatchFailureMode::ContinueOnError) {
+            bail!("--fail-fast can only be used with --file, stdin, or --retry-from");
+        }
+    }
 
     let shutdown = install_shutdown_handler();
+    crate::output::log_event(
+        "download",
+        "command_started",
+        &json!({
+            "batch_mode": is_batch_mode,
+            "dry_run": args.dry_run,
+            "jobs": args.jobs,
+        }),
+    )?;
     let run = async {
         if let Some(retry_from) = &args.retry_from {
             run_manifest_replay(
@@ -259,8 +367,21 @@ pub async fn cmd_download(
                     collision: args.collision,
                     retry: args.retry,
                     jobs: args.jobs,
+                    failure_mode: args.failure_mode,
+                    max_failures: args.max_failures,
                     checkpoint: checkpoint_path_for(retry_from, args.checkpoint.clone()),
                     dry_run: args.dry_run,
+                    success_hook: args.success_hook.clone(),
+                    failure_hook: args.failure_hook.clone(),
+                    archive_path: args.archive_path.clone(),
+                    media_variant: args.media_variant,
+                    name_template: args.name_template.clone(),
+                    output_layout: args.output_layout,
+                    metadata_sidecar: args.metadata_sidecar,
+                    caption_sidecar: args.caption_sidecar,
+                    hash: args.hash,
+                    redownload_on_mismatch: args.redownload_on_mismatch,
+                    print_path_only: args.print_path_only,
                     parallel_chunks: args.parallel_chunks,
                     keep_partial: args.keep_partial,
                     timeouts,
@@ -269,17 +390,35 @@ pub async fn cmd_download(
                 Arc::clone(&caches),
             )
             .await
-        } else if let Some(list_path) = &args.file_list {
+        } else if let Some(source) = batch_source.clone() {
             run_batch_downloads(
                 &client,
                 BatchContext {
-                    list_path: list_path.clone(),
+                    source,
                     out_dir: args.out_dir.clone(),
                     collision: args.collision,
                     retry: args.retry,
                     jobs: args.jobs,
-                    checkpoint: checkpoint_path_for(list_path, args.checkpoint.clone()),
+                    input_format: args.input_format,
+                    failure_mode: args.failure_mode,
+                    max_failures: args.max_failures,
+                    line_range: BatchLineRange::new(args.from_line, args.to_line)?,
+                    checkpoint: checkpoint_path_for_batch_source(
+                        batch_source.as_ref().expect("checked above"),
+                        args.checkpoint.clone(),
+                    ),
                     dry_run: args.dry_run,
+                    success_hook: args.success_hook.clone(),
+                    failure_hook: args.failure_hook.clone(),
+                    archive_path: args.archive_path.clone(),
+                    media_variant: args.media_variant,
+                    name_template: args.name_template.clone(),
+                    output_layout: args.output_layout,
+                    metadata_sidecar: args.metadata_sidecar,
+                    caption_sidecar: args.caption_sidecar,
+                    hash: args.hash,
+                    redownload_on_mismatch: args.redownload_on_mismatch,
+                    print_path_only: args.print_path_only,
                     parallel_chunks: args.parallel_chunks,
                     keep_partial: args.keep_partial,
                     timeouts,
@@ -299,13 +438,48 @@ pub async fn cmd_download(
                 collision: args.collision,
                 retry: args.retry,
                 dry_run: args.dry_run,
+                media_variant: args.media_variant,
+                name_template: args.name_template.clone(),
+                output_layout: args.output_layout,
+                metadata_sidecar: args.metadata_sidecar,
+                caption_sidecar: args.caption_sidecar,
+                hash: args.hash,
+                redownload_on_mismatch: args.redownload_on_mismatch,
+                print_path_only: args.print_path_only,
                 parallel_chunks: args.parallel_chunks,
                 keep_partial: args.keep_partial,
                 timeouts,
             };
-            let result = download_one(&client, &request, &shutdown, &caches).await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            Ok(())
+            match download_one(&client, &request, &shutdown, &caches).await {
+                Ok(result) => {
+                    maybe_archive_result(args.archive_path.as_deref(), &result)?;
+                    crate::output::log_event("download", "item_completed", &result)?;
+                    crate::output::run_hook(
+                        args.success_hook.as_deref(),
+                        "download",
+                        "item_completed",
+                        &result,
+                    )
+                    .await?;
+                    emit_download_result(&result)?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let failure = json!({
+                        "status": "failed",
+                        "error": format!("{:#}", error),
+                    });
+                    crate::output::log_event("download", "item_failed", &failure)?;
+                    crate::output::run_hook(
+                        args.failure_hook.as_deref(),
+                        "download",
+                        "item_failed",
+                        &failure,
+                    )
+                    .await?;
+                    Err(error)
+                }
+            }
         }
     };
 
@@ -342,10 +516,7 @@ pub async fn cmd_inspect(
     )
     .await?;
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&describe_message(&message))?
-    );
+    crate::output::write_command_output("inspect", describe_message(&message))?;
     Ok(())
 }
 
@@ -381,7 +552,7 @@ pub async fn cmd_list_chats(
         }));
     }
 
-    println!("{}", serde_json::to_string_pretty(&Value::Array(chats))?);
+    crate::output::write_command_output("list-chats", json!({ "chats": chats }))?;
     Ok(())
 }
 
@@ -403,7 +574,7 @@ pub async fn cmd_resolve(
         &caches,
     )
     .await?;
-    println!("{}", serde_json::to_string_pretty(&resolved)?);
+    crate::output::write_command_output("resolve", resolved)?;
     Ok(())
 }
 
@@ -424,7 +595,9 @@ fn install_shutdown_handler() -> std::sync::Arc<AtomicBool> {
         if tokio::signal::ctrl_c().await.is_ok() {
             let already_set = signal_flag.swap(true, Ordering::SeqCst);
             if !already_set {
-                eprintln!("Interrupt received. Stopping new work and leaving partial downloads resumable.");
+                crate::output::stderrln(
+                    "Interrupt received. Stopping new work and leaving partial downloads resumable.",
+                );
             }
         }
     });
@@ -445,6 +618,14 @@ struct SingleDownloadRequest {
     collision: CollisionPolicy,
     retry: RetryConfig,
     dry_run: bool,
+    media_variant: MediaVariant,
+    name_template: Option<String>,
+    output_layout: OutputLayout,
+    metadata_sidecar: bool,
+    caption_sidecar: Option<CaptionSidecarFormat>,
+    hash: bool,
+    redownload_on_mismatch: bool,
+    print_path_only: bool,
     parallel_chunks: usize,
     keep_partial: bool,
     timeouts: TimeoutConfig,
@@ -458,7 +639,7 @@ async fn download_one(
 ) -> Result<Value> {
     let operation = async {
         warn_about_ambiguous_selector(&request.selector);
-        let message = fetch_message_with_retry(
+        let messages = fetch_messages_with_retry(
             client,
             &request.selector,
             request.retry,
@@ -467,16 +648,9 @@ async fn download_one(
         )
         .await?;
         if request.dry_run {
-            plan_download(&message, &request.out_dir, request.collision).await
+            plan_download(&messages, request).await
         } else {
-            download_media(
-                client,
-                &message,
-                &request.out_dir,
-                collision_config(request),
-                shutdown,
-            )
-            .await
+            download_media(client, &messages, request, shutdown).await
         }
     };
 
@@ -498,6 +672,76 @@ async fn fetch_message_with_retry(
 ) -> Result<Message> {
     let (peer_spec, msg_id) = resolve_peer_msg(selector)?;
     retry_fetch_message(client, &peer_spec, msg_id, retry, timeouts, caches).await
+}
+
+async fn fetch_messages_with_retry(
+    client: &ResilientClient,
+    selector: &MessageSelectorArgs,
+    retry: RetryConfig,
+    timeouts: TimeoutConfig,
+    caches: &DownloadCaches,
+) -> Result<Vec<Message>> {
+    let (peer_spec, msg_id) = resolve_peer_msg(selector)?;
+    let message = retry_fetch_message(client, &peer_spec, msg_id, retry, timeouts, caches).await?;
+    if let Some(grouped_id) = message.grouped_id() {
+        return fetch_grouped_messages(client, &peer_spec, msg_id, grouped_id, timeouts, caches)
+            .await;
+    }
+
+    Ok(vec![message])
+}
+
+async fn fetch_grouped_messages(
+    client: &ResilientClient,
+    peer_spec: &PeerSpec,
+    anchor_msg_id: i32,
+    grouped_id: i64,
+    timeouts: TimeoutConfig,
+    caches: &DownloadCaches,
+) -> Result<Vec<Message>> {
+    let peer_ref = resolve_peer_ref(client, peer_spec, timeouts, caches).await?;
+    let current_client = client.client().await;
+    let upper_bound = anchor_msg_id.saturating_add(GROUP_FETCH_WINDOW);
+    let lower_bound = anchor_msg_id.saturating_sub(GROUP_FETCH_WINDOW);
+    let mut iter = current_client
+        .iter_messages(peer_ref)
+        .offset_id(upper_bound);
+    let mut messages = Vec::new();
+
+    while let Some(message) = run_request(
+        timeouts.request_timeout,
+        "Grouped message request timed out",
+        iter.next(),
+    )
+    .await??
+    {
+        if message.id() < lower_bound {
+            break;
+        }
+        if message.grouped_id() == Some(grouped_id) {
+            caches.messages.write().await.insert(
+                MessageCacheKey {
+                    peer_spec: peer_spec.clone(),
+                    msg_id: message.id(),
+                },
+                message.clone(),
+            );
+            messages.push(message);
+        }
+    }
+
+    messages.sort_by_key(Message::id);
+    messages.dedup_by_key(|message| message.id());
+
+    if messages.is_empty() {
+        bail!(
+            "Grouped media {} was not found around message {}",
+            grouped_id,
+            anchor_msg_id
+        );
+    }
+
+    Ok(messages)
 }
 
 async fn retry_fetch_message(
@@ -532,10 +776,10 @@ async fn retry_fetch_message(
                 attempt += 1;
                 if let Some(delay) = retryable_delay(&error, attempt, retry) {
                     prepare_retry(client, &error, delay).await?;
-                    eprintln!(
+                    crate::output::stderrln(format!(
                         "Retrying message fetch after error (attempt {}/{}): {}",
                         attempt, retry.retries, error
-                    );
+                    ));
                     continue;
                 }
                 return Err(error);
@@ -546,14 +790,70 @@ async fn retry_fetch_message(
 
 // ── batch download ────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
+enum BatchSource {
+    File(PathBuf),
+    Stdin,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatchLineRange {
+    from_line: Option<usize>,
+    to_line: Option<usize>,
+}
+
+impl BatchLineRange {
+    fn new(from_line: Option<usize>, to_line: Option<usize>) -> Result<Self> {
+        if matches!(from_line, Some(0)) {
+            bail!("--from-line must be at least 1");
+        }
+        if matches!(to_line, Some(0)) {
+            bail!("--to-line must be at least 1");
+        }
+
+        Ok(Self { from_line, to_line })
+    }
+
+    fn contains(self, line_number: usize) -> bool {
+        if self.from_line.is_some_and(|from| line_number < from) {
+            return false;
+        }
+        if self.to_line.is_some_and(|to| line_number > to) {
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BatchEntry {
+    line_number: usize,
+    link: String,
+}
+
 struct BatchContext {
-    list_path: PathBuf,
+    source: BatchSource,
     out_dir: PathBuf,
     collision: CollisionPolicy,
     retry: RetryConfig,
     jobs: usize,
+    input_format: BatchInputFormat,
+    failure_mode: BatchFailureMode,
+    max_failures: Option<usize>,
+    line_range: BatchLineRange,
     checkpoint: PathBuf,
     dry_run: bool,
+    success_hook: Option<String>,
+    failure_hook: Option<String>,
+    archive_path: Option<PathBuf>,
+    media_variant: MediaVariant,
+    name_template: Option<String>,
+    output_layout: OutputLayout,
+    metadata_sidecar: bool,
+    caption_sidecar: Option<CaptionSidecarFormat>,
+    hash: bool,
+    redownload_on_mismatch: bool,
+    print_path_only: bool,
     parallel_chunks: usize,
     keep_partial: bool,
     timeouts: TimeoutConfig,
@@ -565,8 +865,21 @@ struct ManifestReplayContext {
     collision: CollisionPolicy,
     retry: RetryConfig,
     jobs: usize,
+    failure_mode: BatchFailureMode,
+    max_failures: Option<usize>,
     checkpoint: PathBuf,
     dry_run: bool,
+    success_hook: Option<String>,
+    failure_hook: Option<String>,
+    archive_path: Option<PathBuf>,
+    media_variant: MediaVariant,
+    name_template: Option<String>,
+    output_layout: OutputLayout,
+    metadata_sidecar: bool,
+    caption_sidecar: Option<CaptionSidecarFormat>,
+    hash: bool,
+    redownload_on_mismatch: bool,
+    print_path_only: bool,
     parallel_chunks: usize,
     keep_partial: bool,
     timeouts: TimeoutConfig,
@@ -574,13 +887,26 @@ struct ManifestReplayContext {
 
 struct LinkJobContext<'a> {
     client: &'a Arc<ResilientClient>,
-    entries: Vec<(usize, String)>,
+    entries: Vec<BatchEntry>,
     out_dir: &'a Path,
     collision: CollisionPolicy,
     retry: RetryConfig,
     jobs: usize,
+    failure_mode: BatchFailureMode,
+    max_failures: Option<usize>,
     checkpoint_path: &'a Path,
     dry_run: bool,
+    success_hook: Option<&'a str>,
+    failure_hook: Option<&'a str>,
+    archive_path: Option<&'a Path>,
+    media_variant: MediaVariant,
+    name_template: Option<&'a str>,
+    output_layout: OutputLayout,
+    metadata_sidecar: bool,
+    caption_sidecar: Option<CaptionSidecarFormat>,
+    hash: bool,
+    redownload_on_mismatch: bool,
+    print_path_only: bool,
     parallel_chunks: usize,
     keep_partial: bool,
     timeouts: TimeoutConfig,
@@ -590,19 +916,304 @@ struct LinkJobContext<'a> {
 
 #[derive(Debug)]
 struct BatchTaskResult {
-    index: usize,
+    line_number: usize,
     link: String,
     result: Result<Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CheckpointEntry {
-    index: usize,
-    link: String,
-    status: String,
-    file: Option<String>,
-    error: Option<String>,
-    timestamp_unix: u64,
+struct BatchResultContext<'a> {
+    checkpoint_path: &'a Path,
+    writer: &'a mut fs::File,
+    completed_links: &'a mut HashSet<String>,
+    success_count: &'a mut usize,
+    failure_count: &'a mut usize,
+    skipped_count: &'a mut usize,
+    success_hook: Option<&'a str>,
+    failure_hook: Option<&'a str>,
+    archive_path: Option<&'a Path>,
+}
+
+fn resolve_batch_source(args: &DownloadArgs) -> Result<Option<BatchSource>> {
+    if let Some(path) = &args.file_list {
+        return Ok(Some(if path == Path::new("-") {
+            BatchSource::Stdin
+        } else {
+            BatchSource::File(path.clone())
+        }));
+    }
+
+    if args.link.is_none()
+        && args.peer.is_none()
+        && args.msg_id.is_none()
+        && args.retry_from.is_none()
+        && !std::io::stdin().is_terminal()
+    {
+        return Ok(Some(BatchSource::Stdin));
+    }
+
+    Ok(None)
+}
+
+fn checkpoint_path_for_batch_source(
+    source: &BatchSource,
+    override_path: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(path) = override_path {
+        return path;
+    }
+
+    match source {
+        BatchSource::File(path) => checkpoint_path_for(path, None),
+        BatchSource::Stdin => PathBuf::from("stdin.checkpoint.jsonl"),
+    }
+}
+
+fn normalize_link_key(link: &str) -> String {
+    match parse_link(link.trim()) {
+        Ok(ParsedLink::Username { username, msg_id }) => {
+            format!("username:{}:{}", username.to_ascii_lowercase(), msg_id)
+        }
+        Ok(ParsedLink::Channel { channel_id, msg_id }) => {
+            format!("channel:{}:{}", channel_id, msg_id)
+        }
+        Err(_) => link.trim().to_string(),
+    }
+}
+
+fn infer_batch_input_format(
+    source: &BatchSource,
+    requested: BatchInputFormat,
+    lines: &[SourceLine],
+) -> BatchInputFormat {
+    if !matches!(requested, BatchInputFormat::Auto) {
+        return requested;
+    }
+
+    if let BatchSource::File(path) = source {
+        if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+            match ext.to_ascii_lowercase().as_str() {
+                "csv" => return BatchInputFormat::Csv,
+                "jsonl" | "ndjson" => return BatchInputFormat::Jsonl,
+                _ => {}
+            }
+        }
+    }
+
+    let Some(first_non_empty) = lines.iter().find(|line| !line.text.trim().is_empty()) else {
+        return BatchInputFormat::Text;
+    };
+    let trimmed = first_non_empty.text.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('"') {
+        BatchInputFormat::Jsonl
+    } else if trimmed.contains(',') {
+        BatchInputFormat::Csv
+    } else {
+        BatchInputFormat::Text
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SourceLine {
+    line_number: usize,
+    text: String,
+}
+
+async fn read_batch_source_lines(source: &BatchSource) -> Result<Vec<SourceLine>> {
+    let reader: Box<dyn AsyncRead + Unpin + Send> = match source {
+        BatchSource::File(path) => Box::new(
+            fs::File::open(path)
+                .await
+                .with_context(|| format!("Cannot open file list '{}'", path.display()))?,
+        ),
+        BatchSource::Stdin => Box::new(io::stdin()),
+    };
+
+    let mut lines = BufReader::new(reader).lines();
+    let mut out = Vec::new();
+    let mut line_number = 0usize;
+    while let Some(line) = lines.next_line().await? {
+        line_number += 1;
+        out.push(SourceLine {
+            line_number,
+            text: line,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_text_batch_entries(lines: &[SourceLine], line_range: BatchLineRange) -> Vec<BatchEntry> {
+    lines
+        .iter()
+        .filter(|line| line_range.contains(line.line_number))
+        .filter_map(|line| {
+            let link = line.text.trim();
+            if link.is_empty() || link.starts_with('#') {
+                return None;
+            }
+            Some(BatchEntry {
+                line_number: line.line_number,
+                link: link.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_csv_record(line: &str) -> Result<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                if in_quotes && chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = !in_quotes;
+                }
+            }
+            ',' if !in_quotes => {
+                fields.push(field.trim().to_string());
+                field.clear();
+            }
+            _ => field.push(ch),
+        }
+    }
+
+    if in_quotes {
+        bail!("Unterminated quoted CSV field");
+    }
+
+    fields.push(field.trim().to_string());
+    Ok(fields)
+}
+
+fn is_probably_link(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("https://t.me/")
+        || trimmed.starts_with("http://t.me/")
+        || parse_link(trimmed).is_ok()
+}
+
+fn extract_csv_link(row: &[String], selected_column: Option<usize>) -> Option<String> {
+    if let Some(index) = selected_column {
+        return row
+            .get(index)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+    }
+
+    row.iter()
+        .find(|value| is_probably_link(value))
+        .or_else(|| row.iter().find(|value| !value.trim().is_empty()))
+        .map(|value| value.trim().to_string())
+}
+
+fn parse_csv_batch_entries(
+    lines: &[SourceLine],
+    line_range: BatchLineRange,
+) -> Result<Vec<BatchEntry>> {
+    let mut entries = Vec::new();
+    let mut selected_column = None;
+    let mut header_processed = false;
+
+    for line in lines
+        .iter()
+        .filter(|line| line_range.contains(line.line_number))
+    {
+        if line.text.trim().is_empty() {
+            continue;
+        }
+
+        let row = parse_csv_record(&line.text)
+            .with_context(|| format!("Invalid CSV row at line {}", line.line_number))?;
+        if !header_processed {
+            header_processed = true;
+            if let Some((index, _)) = row.iter().enumerate().find(|(_, cell)| {
+                matches!(
+                    cell.trim().to_ascii_lowercase().as_str(),
+                    "link" | "url" | "message_link" | "message_url"
+                )
+            }) {
+                selected_column = Some(index);
+                continue;
+            }
+        }
+
+        if let Some(link) = extract_csv_link(&row, selected_column) {
+            entries.push(BatchEntry {
+                line_number: line.line_number,
+                link,
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+fn parse_jsonl_batch_entries(
+    lines: &[SourceLine],
+    line_range: BatchLineRange,
+) -> Result<Vec<BatchEntry>> {
+    let mut entries = Vec::new();
+
+    for line in lines
+        .iter()
+        .filter(|line| line_range.contains(line.line_number))
+    {
+        let trimmed = line.text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let value: Value = serde_json::from_str(trimmed)
+            .with_context(|| format!("Invalid JSONL entry at line {}", line.line_number))?;
+        let link = match value {
+            Value::String(link) => link,
+            Value::Object(map) => ["link", "url", "message_link", "message_url"]
+                .into_iter()
+                .find_map(|key| map.get(key).and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+                .with_context(|| {
+                    format!(
+                        "JSONL entry at line {} must be a string or object containing link/url/message_link/message_url",
+                        line.line_number
+                    )
+                })?,
+            _ => {
+                bail!(
+                    "JSONL entry at line {} must be a string or object",
+                    line.line_number
+                )
+            }
+        };
+
+        entries.push(BatchEntry {
+            line_number: line.line_number,
+            link: link.trim().to_string(),
+        });
+    }
+
+    Ok(entries)
+}
+
+async fn load_batch_entries(
+    source: &BatchSource,
+    input_format: BatchInputFormat,
+    line_range: BatchLineRange,
+) -> Result<Vec<BatchEntry>> {
+    let lines = read_batch_source_lines(source).await?;
+    let inferred_format = infer_batch_input_format(source, input_format, &lines);
+
+    match inferred_format {
+        BatchInputFormat::Auto => unreachable!("auto format should be resolved before parsing"),
+        BatchInputFormat::Text => Ok(parse_text_batch_entries(&lines, line_range)),
+        BatchInputFormat::Csv => parse_csv_batch_entries(&lines, line_range),
+        BatchInputFormat::Jsonl => parse_jsonl_batch_entries(&lines, line_range),
+    }
 }
 
 async fn run_batch_downloads(
@@ -611,21 +1222,7 @@ async fn run_batch_downloads(
     shutdown: std::sync::Arc<AtomicBool>,
     caches: Arc<DownloadCaches>,
 ) -> Result<()> {
-    let file = fs::File::open(&ctx.list_path)
-        .await
-        .with_context(|| format!("Cannot open file list '{}'", ctx.list_path.display()))?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut entries = Vec::new();
-    let mut index = 0usize;
-    while let Some(line) = lines.next_line().await? {
-        let link = line.trim().to_string();
-        if link.is_empty() || link.starts_with('#') {
-            continue;
-        }
-        index += 1;
-        entries.push((index, link));
-    }
+    let entries = load_batch_entries(&ctx.source, ctx.input_format, ctx.line_range).await?;
 
     prefetch_messages_for_entries(client, &entries, ctx.retry, ctx.timeouts, &caches).await?;
 
@@ -636,8 +1233,21 @@ async fn run_batch_downloads(
         collision: ctx.collision,
         retry: ctx.retry,
         jobs: ctx.jobs,
+        failure_mode: ctx.failure_mode,
+        max_failures: ctx.max_failures,
         checkpoint_path: &ctx.checkpoint,
         dry_run: ctx.dry_run,
+        success_hook: ctx.success_hook.as_deref(),
+        failure_hook: ctx.failure_hook.as_deref(),
+        archive_path: ctx.archive_path.as_deref(),
+        media_variant: ctx.media_variant,
+        name_template: ctx.name_template.as_deref(),
+        output_layout: ctx.output_layout,
+        metadata_sidecar: ctx.metadata_sidecar,
+        caption_sidecar: ctx.caption_sidecar,
+        hash: ctx.hash,
+        redownload_on_mismatch: ctx.redownload_on_mismatch,
+        print_path_only: ctx.print_path_only,
         parallel_chunks: ctx.parallel_chunks,
         keep_partial: ctx.keep_partial,
         timeouts: ctx.timeouts,
@@ -655,9 +1265,9 @@ async fn run_manifest_replay(
 ) -> Result<()> {
     let entries = load_failed_links(&ctx.manifest_path).await?;
     if entries.is_empty() {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
+        crate::output::write_command_output(
+            "download",
+            json!({
                 "status": "completed",
                 "mode": "retry-from",
                 "succeeded": 0,
@@ -667,8 +1277,8 @@ async fn run_manifest_replay(
                 "checkpoint": ctx.checkpoint.display().to_string(),
                 "source_manifest": ctx.manifest_path.display().to_string(),
                 "message": "No failed links found in manifest",
-            }))?
-        );
+            }),
+        )?;
         return Ok(());
     }
 
@@ -681,8 +1291,21 @@ async fn run_manifest_replay(
         collision: ctx.collision,
         retry: ctx.retry,
         jobs: ctx.jobs,
+        failure_mode: ctx.failure_mode,
+        max_failures: ctx.max_failures,
         checkpoint_path: &ctx.checkpoint,
         dry_run: ctx.dry_run,
+        success_hook: ctx.success_hook.as_deref(),
+        failure_hook: ctx.failure_hook.as_deref(),
+        archive_path: ctx.archive_path.as_deref(),
+        media_variant: ctx.media_variant,
+        name_template: ctx.name_template.as_deref(),
+        output_layout: ctx.output_layout,
+        metadata_sidecar: ctx.metadata_sidecar,
+        caption_sidecar: ctx.caption_sidecar,
+        hash: ctx.hash,
+        redownload_on_mismatch: ctx.redownload_on_mismatch,
+        print_path_only: ctx.print_path_only,
         parallel_chunks: ctx.parallel_chunks,
         keep_partial: ctx.keep_partial,
         timeouts: ctx.timeouts,
@@ -700,8 +1323,21 @@ async fn run_link_jobs(ctx: LinkJobContext<'_>) -> Result<()> {
         collision,
         retry,
         jobs,
+        failure_mode,
+        max_failures,
         checkpoint_path,
         dry_run,
+        success_hook,
+        failure_hook,
+        archive_path,
+        media_variant,
+        name_template,
+        output_layout,
+        metadata_sidecar,
+        caption_sidecar,
+        hash,
+        redownload_on_mismatch,
+        print_path_only,
         parallel_chunks,
         keep_partial,
         timeouts,
@@ -710,18 +1346,55 @@ async fn run_link_jobs(ctx: LinkJobContext<'_>) -> Result<()> {
     } = ctx;
 
     let mut completed_links = load_completed_links(checkpoint_path).await?;
-    let mut writer = open_checkpoint_writer(checkpoint_path).await?;
+    let mut writer = open_manifest_writer(checkpoint_path).await?;
     let mut join_set = JoinSet::new();
     let mut success_count = 0usize;
     let mut failure_count = 0usize;
     let mut skipped_count = 0usize;
     let mut checkpoint_skip_count = 0usize;
+    let mut duplicate_skip_count = 0usize;
+    let mut seen_links = HashSet::new();
+    let mut stop_scheduling = false;
     let client_handle = client.clone();
 
-    for (index, link) in entries {
-        if completed_links.contains(&link) {
+    for entry in entries {
+        let line_number = entry.line_number;
+        let link = entry.link;
+        let link_key = normalize_link_key(&link);
+
+        if completed_links.contains(&link_key) {
             checkpoint_skip_count += 1;
-            eprintln!("[{}] Skipping completed checkpoint entry {}", index, link);
+            crate::output::stderrln(format!(
+                "[{}] Skipping completed checkpoint entry {}",
+                line_number, link
+            ));
+            continue;
+        }
+
+        if !seen_links.insert(link_key.clone()) {
+            duplicate_skip_count += 1;
+            let value = json!({
+                "status": "skipped",
+                "reason": "duplicate-input",
+                "input_line": line_number,
+                "link": link,
+            });
+            append_manifest_record(
+                &mut writer,
+                &ManifestRecord {
+                    index: line_number,
+                    link,
+                    status: "skipped".to_string(),
+                    file: None,
+                    error: Some("duplicate input".to_string()),
+                    timestamp_unix: crate::output::unix_timestamp(),
+                    canonical_source_link: None,
+                },
+            )
+            .await?;
+            skipped_count += 1;
+            crate::output::log_event("download", "item_skipped", &value)?;
+            emit_download_result(&value)?;
             continue;
         }
 
@@ -732,17 +1405,26 @@ async fn run_link_jobs(ctx: LinkJobContext<'_>) -> Result<()> {
                 .expect("join set length checked")?;
             handle_batch_result(
                 finished,
-                checkpoint_path,
-                &mut writer,
-                &mut completed_links,
-                &mut success_count,
-                &mut failure_count,
-                &mut skipped_count,
+                BatchResultContext {
+                    checkpoint_path,
+                    writer: &mut writer,
+                    completed_links: &mut completed_links,
+                    success_count: &mut success_count,
+                    failure_count: &mut failure_count,
+                    skipped_count: &mut skipped_count,
+                    success_hook,
+                    failure_hook,
+                    archive_path,
+                },
             )
             .await?;
+            if should_stop_batch(failure_mode, max_failures, failure_count) {
+                stop_scheduling = true;
+                break;
+            }
         }
 
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.load(Ordering::SeqCst) || stop_scheduling {
             break;
         }
 
@@ -756,6 +1438,14 @@ async fn run_link_jobs(ctx: LinkJobContext<'_>) -> Result<()> {
             collision,
             retry,
             dry_run,
+            media_variant,
+            name_template: name_template.map(ToOwned::to_owned),
+            output_layout,
+            metadata_sidecar,
+            caption_sidecar,
+            hash,
+            redownload_on_mismatch,
+            print_path_only,
             parallel_chunks,
             keep_partial,
             timeouts,
@@ -765,7 +1455,7 @@ async fn run_link_jobs(ctx: LinkJobContext<'_>) -> Result<()> {
         let task_caches = Arc::clone(&caches);
         join_set.spawn(async move {
             BatchTaskResult {
-                index,
+                line_number,
                 link,
                 result: download_one(&task_client, &request, &task_shutdown, &task_caches).await,
             }
@@ -776,12 +1466,17 @@ async fn run_link_jobs(ctx: LinkJobContext<'_>) -> Result<()> {
         let finished = task_result?;
         handle_batch_result(
             finished,
-            checkpoint_path,
-            &mut writer,
-            &mut completed_links,
-            &mut success_count,
-            &mut failure_count,
-            &mut skipped_count,
+            BatchResultContext {
+                checkpoint_path,
+                writer: &mut writer,
+                completed_links: &mut completed_links,
+                success_count: &mut success_count,
+                failure_count: &mut failure_count,
+                skipped_count: &mut skipped_count,
+                success_hook,
+                failure_hook,
+                archive_path,
+            },
         )
         .await?;
     }
@@ -792,44 +1487,48 @@ async fn run_link_jobs(ctx: LinkJobContext<'_>) -> Result<()> {
             success_count,
             skipped_count,
             failure_count,
-            checkpoint_skip_count
+            checkpoint_skip_count + duplicate_skip_count
         );
     }
 
     if failure_count > 0 {
         bail!(
-            "Batch download completed with {} succeeded, {} skipped, {} restored from checkpoint, and {} failed.",
+            "Batch download completed with {} succeeded, {} skipped, {} restored from checkpoint or dedupe, and {} failed.",
             success_count,
             skipped_count,
-            checkpoint_skip_count,
+            checkpoint_skip_count + duplicate_skip_count,
             failure_count
         );
     }
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "status": "completed",
-            "succeeded": success_count,
-            "skipped": skipped_count,
-            "checkpoint_skipped": checkpoint_skip_count,
-            "failed": failure_count,
-            "checkpoint": checkpoint_path.display().to_string(),
-            "dry_run": dry_run,
-        }))?
-    );
+    let summary = json!({
+        "status": "completed",
+        "succeeded": success_count,
+        "skipped": skipped_count,
+        "checkpoint_skipped": checkpoint_skip_count,
+        "dedupe_skipped": duplicate_skip_count,
+        "failed": failure_count,
+        "checkpoint": checkpoint_path.display().to_string(),
+        "dry_run": dry_run,
+    });
+    crate::output::log_event("download", "batch_completed", &summary)?;
+    emit_download_result(&summary)?;
     Ok(())
 }
 
-async fn handle_batch_result(
-    result: BatchTaskResult,
-    checkpoint_path: &Path,
-    writer: &mut fs::File,
-    completed_links: &mut HashSet<String>,
-    success_count: &mut usize,
-    failure_count: &mut usize,
-    skipped_count: &mut usize,
-) -> Result<()> {
+async fn handle_batch_result(result: BatchTaskResult, ctx: BatchResultContext<'_>) -> Result<()> {
+    let BatchResultContext {
+        checkpoint_path,
+        writer,
+        completed_links,
+        success_count,
+        failure_count,
+        skipped_count,
+        success_hook,
+        failure_hook,
+        archive_path,
+    } = ctx;
+
     match result.result {
         Ok(value) => {
             let status = value
@@ -840,13 +1539,13 @@ async fn handle_batch_result(
                 *skipped_count += 1;
             } else {
                 *success_count += 1;
-                completed_links.insert(result.link.clone());
+                completed_links.insert(normalize_link_key(&result.link));
             }
 
-            append_checkpoint_entry(
+            append_manifest_record(
                 writer,
-                CheckpointEntry {
-                    index: result.index,
+                &ManifestRecord {
+                    index: result.line_number,
                     link: result.link,
                     status: status.to_string(),
                     file: value
@@ -854,25 +1553,45 @@ async fn handle_batch_result(
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned),
                     error: None,
-                    timestamp_unix: unix_timestamp(),
+                    timestamp_unix: crate::output::unix_timestamp(),
+                    canonical_source_link: value
+                        .get("canonical_source_link")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
                 },
             )
             .await?;
 
-            println!("{}", serde_json::to_string_pretty(&value)?);
+            maybe_archive_result(archive_path, &value)?;
+            crate::output::log_event("download", "item_completed", &value)?;
+            crate::output::run_hook(success_hook, "download", "item_completed", &value).await?;
+            emit_download_result(&value)?;
         }
         Err(error) => {
             *failure_count += 1;
             let rendered = format!("{:#}", error);
-            append_checkpoint_entry(
+            let failure_value = json!({
+                "status": "failed",
+                "input_line": result.line_number,
+                "link": result.link.clone(),
+                "error": rendered,
+            });
+            append_manifest_record(
                 writer,
-                CheckpointEntry {
-                    index: result.index,
+                &ManifestRecord {
+                    index: result.line_number,
                     link: result.link.clone(),
                     status: "failed".to_string(),
                     file: None,
-                    error: Some(rendered.clone()),
-                    timestamp_unix: unix_timestamp(),
+                    error: Some(
+                        failure_value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    ),
+                    timestamp_unix: crate::output::unix_timestamp(),
+                    canonical_source_link: None,
                 },
             )
             .await
@@ -883,101 +1602,100 @@ async fn handle_batch_result(
                 )
             })?;
 
-            eprintln!("[{}] ERROR {}: {}", result.index, result.link, rendered);
+            crate::output::log_event("download", "item_failed", &failure_value)?;
+            crate::output::run_hook(failure_hook, "download", "item_failed", &failure_value)
+                .await?;
+            crate::output::stderrln(format!(
+                "[{}] ERROR {}: {}",
+                result.line_number,
+                result.link,
+                failure_value["error"].as_str().unwrap_or_default()
+            ));
         }
     }
 
     Ok(())
 }
 
-async fn load_completed_links(path: &Path) -> Result<HashSet<String>> {
-    if !fs::try_exists(path)
-        .await
-        .with_context(|| format!("Failed to inspect checkpoint '{}'", path.display()))?
-    {
-        return Ok(HashSet::new());
+fn should_stop_batch(
+    failure_mode: BatchFailureMode,
+    max_failures: Option<usize>,
+    failure_count: usize,
+) -> bool {
+    if matches!(failure_mode, BatchFailureMode::FailFast) && failure_count > 0 {
+        return true;
     }
 
-    let file = fs::File::open(path)
-        .await
-        .with_context(|| format!("Failed to open checkpoint '{}'", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut completed = HashSet::new();
+    max_failures.is_some_and(|limit| failure_count >= limit)
+}
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+fn emit_download_result(value: &Value) -> Result<()> {
+    if value
+        .get("print_path_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        if let Some(items) = value.get("items").and_then(Value::as_array) {
+            for item in items {
+                if let Some(path) = item.get("file").and_then(Value::as_str) {
+                    println!("{}", path);
+                }
+            }
+            return Ok(());
         }
+        if let Some(path) = value.get("file").and_then(Value::as_str) {
+            println!("{}", path);
+            return Ok(());
+        }
+    }
 
-        let entry: CheckpointEntry = serde_json::from_str(&line)
-            .with_context(|| format!("Failed to parse checkpoint entry in '{}'", path.display()))?;
+    crate::output::write_command_output("download", value.clone())
+}
+
+fn maybe_archive_result(path: Option<&Path>, value: &Value) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+
+    crate::output::archive_append(
+        path,
+        &crate::output::event_output("download", "archive_item", value.clone()),
+    )
+}
+
+async fn load_completed_links(path: &Path) -> Result<HashSet<String>> {
+    let mut completed = HashSet::new();
+    let records = match read_manifest_records(path).await {
+        Ok(records) => records,
+        Err(error) if format!("{:#}", error).contains("does not exist") => return Ok(completed),
+        Err(error) => return Err(error),
+    };
+    for entry in records {
         if entry.status == "downloaded" {
-            completed.insert(entry.link);
+            completed.insert(normalize_link_key(&entry.link));
         }
     }
 
     Ok(completed)
 }
 
-async fn load_failed_links(path: &Path) -> Result<Vec<(usize, String)>> {
-    if !fs::try_exists(path)
-        .await
-        .with_context(|| format!("Failed to inspect manifest '{}'", path.display()))?
-    {
-        bail!("Manifest '{}' does not exist", path.display());
-    }
-
-    let file = fs::File::open(path)
-        .await
-        .with_context(|| format!("Failed to open manifest '{}'", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
+async fn load_failed_links(path: &Path) -> Result<Vec<BatchEntry>> {
+    let records = read_manifest_records(path).await?;
     let mut failed = Vec::new();
     let mut index = 0usize;
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry: CheckpointEntry = serde_json::from_str(&line)
-            .with_context(|| format!("Failed to parse manifest entry in '{}'", path.display()))?;
+    for entry in records {
         if entry.status == "failed" {
             index += 1;
-            failed.push((index, entry.link));
+            failed.push(BatchEntry {
+                line_number: index,
+                link: entry.link,
+            });
         }
     }
 
     Ok(failed)
 }
-
-async fn open_checkpoint_writer(path: &Path) -> Result<fs::File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await.with_context(|| {
-            format!(
-                "Failed to create checkpoint directory '{}'",
-                parent.display()
-            )
-        })?;
-    }
-
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)
-        .await
-        .with_context(|| format!("Failed to open checkpoint '{}'", path.display()))
-}
-
-async fn append_checkpoint_entry(writer: &mut fs::File, entry: CheckpointEntry) -> Result<()> {
-    let line = serde_json::to_string(&entry).context("Failed to serialize checkpoint entry")?;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
-}
-
 fn checkpoint_path_for(list_path: &Path, override_path: Option<PathBuf>) -> PathBuf {
     if let Some(path) = override_path {
         return path;
@@ -1060,9 +1778,9 @@ fn warn_about_ambiguous_selector(selector: &MessageSelectorArgs) {
 
 fn warn_about_numeric_peer_input(input: &str) {
     if input.parse::<i64>().is_ok() {
-        eprintln!(
+        crate::output::stderrln(
             "Warning: numeric peer ids are Telegram bare ids and can be ambiguous. \
-Prefer a full Telegram message link or @username when possible."
+Prefer a full Telegram message link or @username when possible.",
         );
     }
 }
@@ -1279,15 +1997,15 @@ async fn populate_dialog_caches(
 
 async fn prefetch_messages_for_entries(
     client: &Arc<ResilientClient>,
-    entries: &[(usize, String)],
+    entries: &[BatchEntry],
     _retry: RetryConfig,
     timeouts: TimeoutConfig,
     caches: &DownloadCaches,
 ) -> Result<()> {
     let mut grouped: HashMap<PeerSpec, Vec<i32>> = HashMap::new();
-    for (_, link) in entries {
+    for entry in entries {
         let selector = MessageSelectorArgs {
-            link: Some(link.clone()),
+            link: Some(entry.link.clone()),
             peer: None,
             msg_id: None,
         };
@@ -1334,147 +2052,346 @@ async fn prefetch_messages_for_entries(
 
 // ── media download and inspect ────────────────────────────────────────────────
 
-async fn download_media(
-    client: &ResilientClient,
-    message: &Message,
-    out_dir: &Path,
-    config: StreamDownloadConfig,
-    shutdown: &AtomicBool,
-) -> Result<Value> {
-    let media = message
-        .media()
-        .context("This message does not contain downloadable media")?;
+#[derive(Debug, Clone)]
+struct ResolvedDownloadTarget {
+    out_path: PathBuf,
+    filename: String,
+    media_type: String,
+    mime_type: String,
+    expected_size: u64,
+    canonical_source_link: Option<String>,
+    grouped_id: Option<i64>,
+    caption: String,
+    metadata: Value,
+}
 
-    fs::create_dir_all(out_dir)
-        .await
-        .with_context(|| format!("Failed to create output directory '{}'", out_dir.display()))?;
+#[derive(Debug, Clone)]
+enum DownloadSource {
+    Document(Document),
+    Photo(grammers_client::media::Photo),
+}
 
-    match media {
-        Media::Document(ref doc) => {
-            let filename = choose_filename_document(doc, message);
-            let out_path = safe_output_path(out_dir, &filename)?;
-            let total = doc.size().unwrap_or(0) as u64;
-            let mime = doc
+impl DownloadSource {
+    fn expected_size(&self) -> u64 {
+        match self {
+            Self::Document(doc) => doc.size().unwrap_or(0) as u64,
+            Self::Photo(photo) => photo.size().unwrap_or(0) as u64,
+        }
+    }
+
+    fn mime_type(&self) -> String {
+        match self {
+            Self::Document(doc) => doc
                 .mime_type()
                 .unwrap_or("application/octet-stream")
-                .to_string();
-
-            let outcome = stream_download(
-                client,
-                doc,
-                &out_path,
-                StreamDownloadConfig {
-                    total_bytes: total,
-                    ..config
-                },
-                shutdown,
-            )
-            .await?;
-
-            Ok(download_result_value(
-                message, &out_path, filename, &mime, total, outcome,
-            ))
+                .to_string(),
+            Self::Photo(_) => "image/jpeg".to_string(),
         }
-        Media::Photo(ref photo) => {
-            let filename = format!(
-                "photo_{}_{}.jpg",
-                message.peer_id().bot_api_dialog_id(),
-                message.id()
-            );
-            let out_path = safe_output_path(out_dir, &filename)?;
-            let total = photo.size().unwrap_or(0) as u64;
+    }
 
-            let outcome = stream_download(
-                client,
-                photo,
-                &out_path,
-                StreamDownloadConfig {
-                    total_bytes: total,
-                    ..config
-                },
-                shutdown,
-            )
-            .await?;
-
-            Ok(download_result_value(
-                message,
-                &out_path,
-                filename,
-                "image/jpeg",
-                total,
-                outcome,
-            ))
-        }
-        other => {
-            bail!(
-                "Unsupported media type: {:?}. Only documents and photos are supported.",
-                other
-            );
+    fn media_type(&self) -> &'static str {
+        match self {
+            Self::Document(_) => "document",
+            Self::Photo(_) => "photo",
         }
     }
 }
 
-async fn plan_download(
-    message: &Message,
-    out_dir: &Path,
-    collision: CollisionPolicy,
+async fn download_media(
+    client: &ResilientClient,
+    messages: &[Message],
+    request: &SingleDownloadRequest,
+    shutdown: &AtomicBool,
 ) -> Result<Value> {
-    let media = message
-        .media()
-        .context("This message does not contain downloadable media")?;
+    let mut items = Vec::new();
+    for message in messages {
+        let Some((target, source)) = resolve_download_target(request, message).await? else {
+            continue;
+        };
+        let outcome = match &source {
+            DownloadSource::Document(doc) => {
+                stream_download_verified(client, doc, &target, request, shutdown).await?
+            }
+            DownloadSource::Photo(photo) => {
+                stream_download_verified(client, photo, &target, request, shutdown).await?
+            }
+        };
+        let mut item = download_result_value(
+            message,
+            &target.out_path,
+            target.filename.clone(),
+            &target.mime_type,
+            target.expected_size,
+            outcome,
+        );
+        augment_item_result(&mut item, &target, message, request).await?;
+        items.push(item);
+    }
 
-    fs::create_dir_all(out_dir)
-        .await
-        .with_context(|| format!("Failed to create output directory '{}'", out_dir.display()))?;
+    summarize_download_items(items, request)
+}
 
-    let (filename, mime_type, size, out_path) = match media {
-        Media::Document(ref doc) => {
-            let filename = choose_filename_document(doc, message);
-            let out_path = safe_output_path(out_dir, &filename)?;
-            (
-                filename,
-                doc.mime_type()
-                    .unwrap_or("application/octet-stream")
-                    .to_string(),
-                doc.size().unwrap_or(0) as u64,
-                out_path,
-            )
+async fn plan_download(messages: &[Message], request: &SingleDownloadRequest) -> Result<Value> {
+    let mut items = Vec::new();
+    for message in messages {
+        let Some((target, _source)) = resolve_download_target(request, message).await? else {
+            continue;
+        };
+        let collision_result =
+            inspect_output_collision(&target.out_path, request.collision).await?;
+        items.push(json!({
+            "status": "planned",
+            "message_id": message.id(),
+            "peer_id": message.peer_id().bot_api_dialog_id(),
+            "canonical_source_link": target.canonical_source_link,
+            "file": target.out_path.display().to_string(),
+            "filename": target.filename,
+            "mime_type": target.mime_type,
+            "size": target.expected_size,
+            "media_type": target.media_type,
+            "grouped_id": target.grouped_id,
+            "collision_policy": collision_policy_name(request.collision),
+            "collision_result": collision_result,
+            "dry_run": true,
+        }));
+    }
+
+    summarize_download_items(items, request)
+}
+
+async fn stream_download_verified<D: Downloadable + Clone + Send + Sync + 'static>(
+    client: &ResilientClient,
+    downloadable: &D,
+    target: &ResolvedDownloadTarget,
+    request: &SingleDownloadRequest,
+    shutdown: &AtomicBool,
+) -> Result<DownloadOutcome> {
+    let mut redownloaded = false;
+    loop {
+        let outcome = stream_download(
+            client,
+            downloadable,
+            &target.out_path,
+            StreamDownloadConfig {
+                total_bytes: target.expected_size,
+                collision: if redownloaded {
+                    CollisionPolicy::Overwrite
+                } else {
+                    request.collision
+                },
+                retry: request.retry,
+                parallel_chunks: request.parallel_chunks,
+                keep_partial: request.keep_partial,
+                request_timeout: request.timeouts.request_timeout,
+            },
+            shutdown,
+        )
+        .await?;
+        match verify_size_match(&target.out_path, target.expected_size) {
+            Ok(()) => return Ok(outcome),
+            Err(_error) if request.redownload_on_mismatch && !redownloaded => {
+                redownloaded = true;
+                if fs::try_exists(&target.out_path).await.unwrap_or(false) {
+                    let _ = fs::remove_file(&target.out_path).await;
+                }
+                let partial = partial_download_path(&target.out_path);
+                if fs::try_exists(&partial).await.unwrap_or(false) {
+                    let _ = fs::remove_file(&partial).await;
+                }
+                crate::output::stderrln(format!(
+                    "Size mismatch for '{}', redownloading from scratch.",
+                    target.out_path.display()
+                ));
+                continue;
+            }
+            Err(error) => return Err(error),
         }
-        Media::Photo(ref photo) => {
-            let filename = format!(
-                "photo_{}_{}.jpg",
-                message.peer_id().bot_api_dialog_id(),
-                message.id()
+    }
+}
+
+fn verify_size_match(out_path: &Path, expected_size: u64) -> Result<()> {
+    if expected_size == 0 {
+        return Ok(());
+    }
+
+    let actual_size = std::fs::metadata(out_path)
+        .with_context(|| format!("Failed to inspect '{}'", out_path.display()))?
+        .len();
+    if actual_size != expected_size {
+        bail!(
+            "Downloaded file '{}' has size {} but Telegram reported {}",
+            out_path.display(),
+            actual_size,
+            expected_size
+        );
+    }
+
+    Ok(())
+}
+
+async fn augment_item_result(
+    item: &mut Value,
+    target: &ResolvedDownloadTarget,
+    message: &Message,
+    request: &SingleDownloadRequest,
+) -> Result<()> {
+    if let Some(object) = item.as_object_mut() {
+        object.insert(
+            "media_type".to_string(),
+            Value::String(target.media_type.clone()),
+        );
+        object.insert(
+            "grouped_id".to_string(),
+            target.grouped_id.map(Value::from).unwrap_or(Value::Null),
+        );
+    }
+
+    if request.hash && item.get("status").and_then(Value::as_str) == Some("downloaded") {
+        let sha256 = sha256_file(&target.out_path)?;
+        item.as_object_mut()
+            .context("download result must be an object")?
+            .insert("sha256".to_string(), Value::String(sha256));
+    }
+
+    if request.metadata_sidecar {
+        let metadata_path = write_metadata_sidecar(target, message, item).await?;
+        item.as_object_mut()
+            .context("download result must be an object")?
+            .insert(
+                "metadata_sidecar".to_string(),
+                Value::String(metadata_path.display().to_string()),
             );
-            let out_path = safe_output_path(out_dir, &filename)?;
-            (
-                filename,
-                "image/jpeg".to_string(),
-                photo.size().unwrap_or(0) as u64,
-                out_path,
-            )
+    }
+
+    if let Some(format) = request.caption_sidecar {
+        if !target.caption.is_empty() {
+            let caption_path = write_caption_sidecar(target, format).await?;
+            item.as_object_mut()
+                .context("download result must be an object")?
+                .insert(
+                    "caption_sidecar".to_string(),
+                    Value::String(caption_path.display().to_string()),
+                );
         }
-        other => {
-            bail!(
-                "Unsupported media type: {:?}. Only documents and photos are supported.",
-                other
-            );
-        }
+    }
+    Ok(())
+}
+
+fn summarize_download_items(items: Vec<Value>, request: &SingleDownloadRequest) -> Result<Value> {
+    if items.is_empty() {
+        bail!("No downloadable media matched the selected media variant");
+    }
+
+    let first = items[0].clone();
+    let all_statuses: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item.get("status").and_then(Value::as_str))
+        .collect();
+    let status = if all_statuses.iter().all(|status| *status == "planned") {
+        "planned"
+    } else if all_statuses.iter().all(|status| *status == "skipped") {
+        "skipped"
+    } else {
+        "downloaded"
     };
+    let files: Vec<Value> = items
+        .iter()
+        .filter_map(|item| item.get("file").cloned())
+        .collect();
 
-    let collision_result = inspect_output_collision(&out_path, collision).await?;
-    Ok(json!({
-        "status": "planned",
+    let mut summary = json!({
+        "status": status,
+        "item_count": items.len(),
+        "files": files,
+        "items": items,
+        "print_path_only": request.print_path_only,
+    });
+
+    if let Some(object) = summary.as_object_mut() {
+        for key in [
+            "file",
+            "filename",
+            "mime_type",
+            "message_id",
+            "peer_id",
+            "canonical_source_link",
+            "grouped_id",
+        ] {
+            if let Some(value) = first.get(key).cloned() {
+                object.insert(key.to_string(), value);
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+async fn write_metadata_sidecar(
+    target: &ResolvedDownloadTarget,
+    message: &Message,
+    item: &Value,
+) -> Result<PathBuf> {
+    let path = sidecar_path(&target.out_path, "json");
+    let metadata = json!({
         "message_id": message.id(),
         "peer_id": message.peer_id().bot_api_dialog_id(),
-        "file": out_path.display().to_string(),
-        "filename": filename,
-        "mime_type": mime_type,
-        "size": size,
-        "collision_policy": collision_policy_name(collision),
-        "collision_result": collision_result,
-        "dry_run": true,
-    }))
+        "grouped_id": message.grouped_id(),
+        "chat": message.peer().map(describe_peer),
+        "sender": message.sender().map(describe_peer),
+        "date": message.date().to_rfc3339(),
+        "caption": message.text(),
+        "mime_type": target.mime_type,
+        "media_type": target.media_type,
+        "source_link": target.canonical_source_link,
+        "file": target.out_path.display().to_string(),
+        "filename": target.filename,
+        "result": item,
+        "message": target.metadata.clone(),
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&metadata)?)
+        .await
+        .with_context(|| format!("Failed to write metadata sidecar '{}'", path.display()))?;
+    Ok(path)
+}
+
+async fn write_caption_sidecar(
+    target: &ResolvedDownloadTarget,
+    format: CaptionSidecarFormat,
+) -> Result<PathBuf> {
+    let (path, bytes) = match format {
+        CaptionSidecarFormat::Txt => (
+            sidecar_path(&target.out_path, "txt"),
+            target.caption.as_bytes().to_vec(),
+        ),
+        CaptionSidecarFormat::Json => (
+            sidecar_path(&target.out_path, "caption.json"),
+            serde_json::to_vec_pretty(&json!({
+                "caption": target.caption,
+                "file": target.out_path.display().to_string(),
+                "source_link": target.canonical_source_link,
+            }))?,
+        ),
+    };
+    fs::write(&path, bytes)
+        .await
+        .with_context(|| format!("Failed to write caption sidecar '{}'", path.display()))?;
+    Ok(path)
+}
+
+fn sidecar_path(out_path: &Path, suffix: &str) -> PathBuf {
+    let file_name = out_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    out_path.with_file_name(format!("{}.{}", file_name, suffix))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read '{}' for hashing", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn describe_message(message: &Message) -> Value {
@@ -1484,6 +2401,7 @@ fn describe_message(message: &Message) -> Value {
     json!({
         "id": message.id(),
         "peer_id": message.peer_id().bot_api_dialog_id(),
+        "canonical_source_link": canonical_source_link(message),
         "date": message.date().to_rfc3339(),
         "text": message.text(),
         "has_media": message.media().is_some(),
@@ -1574,19 +2492,215 @@ fn download_result_value(
         "mime_type": mime_type,
         "message_id": message.id(),
         "peer_id": message.peer_id().bot_api_dialog_id(),
+        "canonical_source_link": canonical_source_link(message),
         "resumed": resumed,
     })
 }
 
-fn collision_config(request: &SingleDownloadRequest) -> StreamDownloadConfig {
-    StreamDownloadConfig {
-        total_bytes: 0,
-        collision: request.collision,
-        retry: request.retry,
-        parallel_chunks: request.parallel_chunks,
-        keep_partial: request.keep_partial,
-        request_timeout: request.timeouts.request_timeout,
+fn canonical_source_link(message: &Message) -> Option<String> {
+    if let Some(peer) = message.peer() {
+        if let Some(username) = peer.username() {
+            return Some(format!("https://t.me/{}/{}", username, message.id()));
+        }
     }
+
+    let dialog_id = message.peer_id().bot_api_dialog_id().to_string();
+    dialog_id
+        .strip_prefix("-100")
+        .map(|channel_id| format!("https://t.me/c/{}/{}", channel_id, message.id()))
+}
+
+fn resolve_download_source(
+    message: &Message,
+    media_variant: MediaVariant,
+) -> Option<DownloadSource> {
+    match message.media()? {
+        Media::Document(doc) => {
+            if matches!(media_variant, MediaVariant::LargestPhoto) {
+                None
+            } else {
+                Some(DownloadSource::Document(doc.clone()))
+            }
+        }
+        Media::Photo(photo) => {
+            if matches!(media_variant, MediaVariant::OriginalDocument) {
+                None
+            } else {
+                Some(DownloadSource::Photo(photo.clone()))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn peer_label(message: &Message) -> String {
+    message
+        .peer()
+        .and_then(|peer| peer.username().map(ToOwned::to_owned))
+        .or_else(|| {
+            message
+                .peer()
+                .and_then(|peer| peer.name().map(sanitize_filename))
+        })
+        .unwrap_or_else(|| message.peer_id().bot_api_dialog_id().to_string())
+}
+
+fn message_date_slug(message: &Message) -> String {
+    message.date().format("%Y-%m-%d").to_string()
+}
+
+fn output_dir_for_layout(
+    base: &Path,
+    layout: OutputLayout,
+    message: &Message,
+    media_type: &str,
+) -> PathBuf {
+    match layout {
+        OutputLayout::Flat => base.to_path_buf(),
+        OutputLayout::Chat => base.join(sanitize_filename(&peer_label(message))),
+        OutputLayout::Date => base.join(message_date_slug(message)),
+        OutputLayout::MediaType => base.join(media_type),
+    }
+}
+
+fn render_name_template(
+    template: Option<&str>,
+    base_filename: &str,
+    message: &Message,
+    media_type: &str,
+) -> String {
+    let Some(template) = template else {
+        return base_filename.to_string();
+    };
+    let rendered = template
+        .replace("{chat}", &peer_label(message))
+        .replace(
+            "{chat_id}",
+            &message.peer_id().bot_api_dialog_id().to_string(),
+        )
+        .replace("{msg_id}", &message.id().to_string())
+        .replace("{filename}", base_filename)
+        .replace("{media_type}", media_type)
+        .replace("{date}", &message_date_slug(message));
+
+    if Path::new(&rendered).extension().is_none() {
+        if let Some(ext) = Path::new(base_filename)
+            .extension()
+            .and_then(|ext| ext.to_str())
+        {
+            return format!("{}.{}", rendered, ext);
+        }
+    }
+
+    rendered
+}
+
+fn choose_filename_for_source(source: &DownloadSource, message: &Message) -> String {
+    match source {
+        DownloadSource::Document(doc) => choose_filename_document(doc, message),
+        DownloadSource::Photo(_) => format!(
+            "photo_{}_{}.jpg",
+            message.peer_id().bot_api_dialog_id(),
+            message.id()
+        ),
+    }
+}
+
+async fn resolve_target_path(
+    request: &SingleDownloadRequest,
+    message: &Message,
+    source: &DownloadSource,
+) -> Result<(PathBuf, String)> {
+    let media_type = source.media_type();
+    let base_dir =
+        output_dir_for_layout(&request.out_dir, request.output_layout, message, media_type);
+    fs::create_dir_all(&base_dir)
+        .await
+        .with_context(|| format!("Failed to create output directory '{}'", base_dir.display()))?;
+
+    let base_filename = choose_filename_for_source(source, message);
+    let rendered = render_name_template(
+        request.name_template.as_deref(),
+        &base_filename,
+        message,
+        media_type,
+    );
+    let filename = sanitize_filename(&rendered);
+    let out_path = safe_output_path(&base_dir, &filename)?;
+    if matches!(request.collision, CollisionPolicy::SuffixExisting) {
+        let suffixed = choose_suffix_output_path(&out_path).await?;
+        return Ok((
+            suffixed.clone(),
+            suffixed
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&filename)
+                .to_string(),
+        ));
+    }
+
+    Ok((out_path, filename))
+}
+
+async fn choose_suffix_output_path(base_path: &Path) -> Result<PathBuf> {
+    if !fs::try_exists(base_path).await?
+        && !fs::try_exists(&partial_download_path(base_path)).await?
+    {
+        return Ok(base_path.to_path_buf());
+    }
+
+    let stem = base_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("file");
+    let ext = base_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!(".{}", ext))
+        .unwrap_or_default();
+
+    for index in 1..10_000usize {
+        let candidate = base_path.with_file_name(format!("{} ({}){}", stem, index, ext));
+        if !fs::try_exists(&candidate).await?
+            && !fs::try_exists(&partial_download_path(&candidate)).await?
+        {
+            return Ok(candidate);
+        }
+    }
+
+    bail!(
+        "Could not find a free suffixed filename for '{}'",
+        base_path.display()
+    )
+}
+
+async fn resolve_download_target(
+    request: &SingleDownloadRequest,
+    message: &Message,
+) -> Result<Option<(ResolvedDownloadTarget, DownloadSource)>> {
+    let Some(source) = resolve_download_source(message, request.media_variant) else {
+        return Ok(None);
+    };
+    let (out_path, filename) = resolve_target_path(request, message, &source).await?;
+    let mime_type = source.mime_type();
+    let media_type = source.media_type().to_string();
+    let expected_size = source.expected_size();
+    let canonical_source_link = canonical_source_link(message);
+
+    Ok(Some((
+        ResolvedDownloadTarget {
+            out_path,
+            filename,
+            media_type,
+            mime_type: mime_type.clone(),
+            expected_size,
+            canonical_source_link: canonical_source_link.clone(),
+            grouped_id: message.grouped_id(),
+            caption: message.text().to_string(),
+            metadata: describe_message(message),
+        },
+        source,
+    )))
 }
 
 /// Choose a filename for a document message.
@@ -1789,13 +2903,15 @@ async fn stream_download<D: Downloadable + Clone + Send + Sync + 'static>(
                             Some(delay),
                             config.parallel_chunks,
                         );
-                        pb.println(format!(
-                            "Transient download error for '{}', retrying in {} ms (attempt {}/{}).",
-                            out_path.display(),
-                            delay.as_millis(),
-                            attempt,
-                            config.retry.retries
-                        ));
+                        if crate::output::progress_enabled() {
+                            pb.println(format!(
+                                "Transient download error for '{}', retrying in {} ms (attempt {}/{}).",
+                                out_path.display(),
+                                delay.as_millis(),
+                                attempt,
+                                config.retry.retries
+                            ));
+                        }
                         break;
                     }
 
@@ -1809,6 +2925,10 @@ async fn stream_download<D: Downloadable + Clone + Send + Sync + 'static>(
 }
 
 fn make_progress_bar(total_bytes: u64, initial_bytes: u64, parallel_chunks: usize) -> ProgressBar {
+    if !crate::output::progress_enabled() {
+        return ProgressBar::hidden();
+    }
+
     if total_bytes > 0 {
         let pb = ProgressBar::new(total_bytes);
         pb.set_style(
@@ -2058,6 +3178,7 @@ async fn prepare_output_file(
                     .await
                     .with_context(|| format!("Failed to remove '{}'", out_path.display()))?;
             }
+            CollisionPolicy::SuffixExisting => {}
         }
     }
 
@@ -2092,6 +3213,7 @@ async fn prepare_output_file(
                     resumed: true,
                 });
             }
+            CollisionPolicy::SuffixExisting => {}
         }
     }
 
@@ -2264,10 +3386,12 @@ async fn inspect_output_collision(
         (true, _, CollisionPolicy::SkipExisting) => "skip-existing-file",
         (true, _, CollisionPolicy::Resume) => "skip-complete-file",
         (true, _, CollisionPolicy::Overwrite) => "overwrite-file",
+        (true, _, CollisionPolicy::SuffixExisting) => "suffix-existing-file",
         (true, _, CollisionPolicy::Error) => "error-existing-file",
         (false, true, CollisionPolicy::SkipExisting) => "skip-partial-file",
         (false, true, CollisionPolicy::Resume) => "resume-partial-file",
         (false, true, CollisionPolicy::Overwrite) => "overwrite-partial-file",
+        (false, true, CollisionPolicy::SuffixExisting) => "suffix-partial-file",
         (false, true, CollisionPolicy::Error) => "error-partial-file",
         (false, false, _) => "write-new-file",
     };
@@ -2281,6 +3405,7 @@ fn collision_policy_name(policy: CollisionPolicy) -> &'static str {
         CollisionPolicy::SkipExisting => "skip-existing",
         CollisionPolicy::Overwrite => "overwrite",
         CollisionPolicy::Resume => "resume",
+        CollisionPolicy::SuffixExisting => "suffix-existing",
     }
 }
 
@@ -2407,13 +3532,6 @@ fn mime_to_ext(mime: &str) -> &str {
     }
 }
 
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2446,19 +3564,23 @@ mod tests {
     #[test]
     fn test_collision_policy_from_flags() {
         assert_eq!(
-            CollisionPolicy::from_flags(true, false, false),
+            CollisionPolicy::from_flags(true, false, false, false),
             CollisionPolicy::SkipExisting
         );
         assert_eq!(
-            CollisionPolicy::from_flags(false, true, false),
+            CollisionPolicy::from_flags(false, true, false, false),
             CollisionPolicy::Overwrite
         );
         assert_eq!(
-            CollisionPolicy::from_flags(false, false, true),
+            CollisionPolicy::from_flags(false, false, true, false),
             CollisionPolicy::Resume
         );
         assert_eq!(
-            CollisionPolicy::from_flags(false, false, false),
+            CollisionPolicy::from_flags(false, false, false, true),
+            CollisionPolicy::SuffixExisting
+        );
+        assert_eq!(
+            CollisionPolicy::from_flags(false, false, false, false),
             CollisionPolicy::Error
         );
     }
@@ -2495,44 +3617,136 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_csv_batch_entries_with_header() {
+        let entries = parse_csv_batch_entries(
+            &[
+                SourceLine {
+                    line_number: 1,
+                    text: "link,label".to_string(),
+                },
+                SourceLine {
+                    line_number: 2,
+                    text: "https://t.me/example/1,first".to_string(),
+                },
+                SourceLine {
+                    line_number: 3,
+                    text: "https://t.me/example/2,second".to_string(),
+                },
+            ],
+            BatchLineRange::new(None, None).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].line_number, 2);
+        assert_eq!(entries[0].link, "https://t.me/example/1");
+        assert_eq!(entries[1].line_number, 3);
+        assert_eq!(entries[1].link, "https://t.me/example/2");
+    }
+
+    #[test]
+    fn test_parse_jsonl_batch_entries() {
+        let entries = parse_jsonl_batch_entries(
+            &[
+                SourceLine {
+                    line_number: 1,
+                    text: "\"https://t.me/example/1\"".to_string(),
+                },
+                SourceLine {
+                    line_number: 2,
+                    text: "{\"link\":\"https://t.me/example/2\"}".to_string(),
+                },
+            ],
+            BatchLineRange::new(None, None).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].link, "https://t.me/example/1");
+        assert_eq!(entries[1].link, "https://t.me/example/2");
+    }
+
+    #[test]
+    fn test_parse_text_batch_entries_respects_line_range() {
+        let entries = parse_text_batch_entries(
+            &[
+                SourceLine {
+                    line_number: 1,
+                    text: "# comment".to_string(),
+                },
+                SourceLine {
+                    line_number: 2,
+                    text: "https://t.me/example/1".to_string(),
+                },
+                SourceLine {
+                    line_number: 3,
+                    text: "https://t.me/example/2".to_string(),
+                },
+            ],
+            BatchLineRange::new(Some(3), Some(3)).unwrap(),
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].line_number, 3);
+        assert_eq!(entries[0].link, "https://t.me/example/2");
+    }
+
+    #[test]
+    fn test_should_stop_batch() {
+        assert!(should_stop_batch(BatchFailureMode::FailFast, None, 1));
+        assert!(should_stop_batch(
+            BatchFailureMode::ContinueOnError,
+            Some(2),
+            2
+        ));
+        assert!(!should_stop_batch(
+            BatchFailureMode::ContinueOnError,
+            Some(2),
+            1
+        ));
+    }
+
     #[tokio::test]
     async fn test_load_completed_links() {
         let path = std::env::temp_dir().join(format!(
             "tw-dl-checkpoint-{}-{}.jsonl",
             std::process::id(),
-            unix_timestamp()
+            crate::output::unix_timestamp()
         ));
-        let mut file = open_checkpoint_writer(&path).await.unwrap();
-        append_checkpoint_entry(
+        let mut file = open_manifest_writer(&path).await.unwrap();
+        append_manifest_record(
             &mut file,
-            CheckpointEntry {
+            &ManifestRecord {
                 index: 1,
                 link: "https://t.me/example/1".to_string(),
                 status: "downloaded".to_string(),
                 file: Some("/tmp/out.mp4".to_string()),
                 error: None,
-                timestamp_unix: unix_timestamp(),
+                timestamp_unix: crate::output::unix_timestamp(),
+                canonical_source_link: None,
             },
         )
         .await
         .unwrap();
-        append_checkpoint_entry(
+        append_manifest_record(
             &mut file,
-            CheckpointEntry {
+            &ManifestRecord {
                 index: 2,
                 link: "https://t.me/example/2".to_string(),
                 status: "failed".to_string(),
                 file: None,
                 error: Some("boom".to_string()),
-                timestamp_unix: unix_timestamp(),
+                timestamp_unix: crate::output::unix_timestamp(),
+                canonical_source_link: None,
             },
         )
         .await
         .unwrap();
 
         let links = load_completed_links(&path).await.unwrap();
-        assert!(links.contains("https://t.me/example/1"));
-        assert!(!links.contains("https://t.me/example/2"));
+        assert!(links.contains(&normalize_link_key("https://t.me/example/1")));
+        assert!(!links.contains(&normalize_link_key("https://t.me/example/2")));
 
         let _ = std::fs::remove_file(path);
     }
@@ -2542,38 +3756,42 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "tw-dl-failed-links-{}-{}.jsonl",
             std::process::id(),
-            unix_timestamp()
+            crate::output::unix_timestamp()
         ));
-        let mut file = open_checkpoint_writer(&path).await.unwrap();
-        append_checkpoint_entry(
+        let mut file = open_manifest_writer(&path).await.unwrap();
+        append_manifest_record(
             &mut file,
-            CheckpointEntry {
+            &ManifestRecord {
                 index: 1,
                 link: "https://t.me/example/1".to_string(),
                 status: "downloaded".to_string(),
                 file: Some("/tmp/out.mp4".to_string()),
                 error: None,
-                timestamp_unix: unix_timestamp(),
+                timestamp_unix: crate::output::unix_timestamp(),
+                canonical_source_link: None,
             },
         )
         .await
         .unwrap();
-        append_checkpoint_entry(
+        append_manifest_record(
             &mut file,
-            CheckpointEntry {
+            &ManifestRecord {
                 index: 2,
                 link: "https://t.me/example/2".to_string(),
                 status: "failed".to_string(),
                 file: None,
                 error: Some("boom".to_string()),
-                timestamp_unix: unix_timestamp(),
+                timestamp_unix: crate::output::unix_timestamp(),
+                canonical_source_link: None,
             },
         )
         .await
         .unwrap();
 
         let links = load_failed_links(&path).await.unwrap();
-        assert_eq!(links, vec![(1, "https://t.me/example/2".to_string())]);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].line_number, 1);
+        assert_eq!(links[0].link, "https://t.me/example/2");
 
         let _ = std::fs::remove_file(path);
     }
@@ -2583,7 +3801,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!(
             "tw-dl-collision-{}-{}",
             std::process::id(),
-            unix_timestamp()
+            crate::output::unix_timestamp()
         ));
         std::fs::create_dir_all(&base).unwrap();
         let out_path = base.join("video.mp4");
@@ -2605,8 +3823,52 @@ mod tests {
                 .unwrap(),
             "skip-existing-file"
         );
+        assert_eq!(
+            inspect_output_collision(&out_path, CollisionPolicy::SuffixExisting)
+                .await
+                .unwrap(),
+            "suffix-existing-file"
+        );
 
         let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_dir(base);
+    }
+
+    #[test]
+    fn test_sidecar_path_appends_suffix_to_filename() {
+        let path = Path::new("/tmp/video.mp4");
+        assert_eq!(
+            sidecar_path(path, "json"),
+            PathBuf::from("/tmp/video.mp4.json")
+        );
+        assert_eq!(
+            sidecar_path(path, "caption.json"),
+            PathBuf::from("/tmp/video.mp4.caption.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_choose_suffix_output_path_picks_next_available_name() {
+        let base = std::env::temp_dir().join(format!(
+            "tw-dl-suffix-{}-{}",
+            std::process::id(),
+            crate::output::unix_timestamp()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let path = base.join("video.mp4");
+        let path_1 = base.join("video (1).mp4");
+        let path_2_part = partial_download_path(&base.join("video (2).mp4"));
+        std::fs::write(&path, b"done").unwrap();
+        std::fs::write(&path_1, b"done").unwrap();
+        std::fs::write(&path_2_part, b"partial").unwrap();
+
+        let candidate = choose_suffix_output_path(&path).await.unwrap();
+        assert_eq!(candidate, base.join("video (3).mp4"));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path_1);
+        let _ = std::fs::remove_file(path_2_part);
         let _ = std::fs::remove_dir(base);
     }
 

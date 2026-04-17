@@ -10,7 +10,7 @@ It signs in as your normal Telegram account and can download media from chats, c
 - Supports public links like `https://t.me/channel/123`
 - Supports private/supergroup links like `https://t.me/c/1234567890/123`
 - Supports direct targeting with `--peer` and `--msg`
-- Supports batch downloads from a text file with `--file`
+- Supports batch downloads from text, CSV, or JSONL input via `--file` or stdin
 - Supports resumable partial downloads with `--resume`
 - Supports collision policies with `--skip-existing`, `--overwrite`, and `--resume`
 - Supports retry/backoff for transient network failures
@@ -18,9 +18,21 @@ It signs in as your normal Telegram account and can download media from chats, c
 - Supports adaptive pacing after flood-wait/rate-limit responses
 - Supports concurrent batch jobs with `--jobs`
 - Supports checkpoint manifests for large batch runs
+- Supports manifest export/import for checkpoints and batch results
+- Supports grouped-message and album downloads
+- Supports media selection with `--media-variant`
+- Supports templated filenames and output subdirectories
+- Supports metadata, caption, and hashing sidecars for downloaded files
+- Supports `--print-path-only` for scripting-friendly download output
 - Supports `--keep-partial` to preserve `.part` files after failed or timed-out downloads
 - Supports cached peer/message metadata lookups for faster repeated batch downloads
 - Supports optional parallel chunk downloads for large files with `--parallel-chunks`
+- Supports structured JSON logs with `--log-file`
+- Supports per-item success and failure hooks for automation
+- Supports JSONL archives for downloaded item metadata
+- Supports shell completion generation for Bash, Zsh, Fish, and PowerShell
+- Emits stable schema-tagged JSON envelopes for scripting
+- Exposes reusable logic as a `tw_dl` library crate
 - Shows transfer throughput, retry count, and backoff state in progress output
 - Supports stale session-lock expiry and manual recovery with `--force-unlock`
 - Supports metadata inspection without downloading via `inspect`
@@ -153,6 +165,8 @@ Commands:
 - `download` - download media from one or more Telegram messages
 - `inspect` - inspect a message and print metadata as JSON
 - `doctor` - validate config, session, and authorization state
+- `completions` - generate shell completion scripts
+- `manifest` - import or export checkpoint and manifest files
 
 Global options:
 
@@ -160,6 +174,11 @@ Global options:
 - `--yes`: assume yes for confirmation prompts
 - `--force-unlock`: remove an existing session lock before opening the session
 - `--stale-lock-age-secs <SECS>`: treat session locks older than this as stale
+- `--log-file <FILE>`: append structured JSON logs to this file
+- `--json`: emit machine-readable JSON output
+- `--human`: emit human-readable output
+- `--quiet`: reduce non-essential stderr output
+- `--no-progress`: disable progress bars during downloads
 - `-h, --help`: show help
 - `-V, --version`: show version
 
@@ -266,9 +285,27 @@ Options:
 - `--retry-delay-ms <MS>`: initial retry delay in milliseconds
 - `--max-retry-delay-ms <MS>`: maximum retry delay in milliseconds
 - `--jobs <N>`: number of concurrent jobs in batch mode
+- `--input-format <auto|text|csv|jsonl>`: batch input format for `--file` or stdin
+- `--continue-on-error`: continue scheduling remaining batch items after failures
+- `--fail-fast`: stop scheduling new batch items after the first failure
+- `--max-failures <N>`: stop scheduling new batch items after `N` failures
+- `--from-line <N>`: start processing at this 1-based input line number
+- `--to-line <N>`: stop processing after this 1-based input line number
 - `--checkpoint <FILE>`: JSONL checkpoint manifest for batch mode
 - `--dry-run`: preview what would be downloaded without writing files
 - `--retry-from <FILE>`: replay only failed links from a previous manifest/checkpoint
+- `--success-hook <COMMAND>`: run a shell command after each successful item
+- `--failure-hook <COMMAND>`: run a shell command after each failed item
+- `--archive <FILE>`: append processed item metadata to a JSONL archive
+- `--media-variant <auto|largest-photo|original-document>`: choose which Telegram media variant to download when supported
+- `--name-template <TEMPLATE>`: customize output names, for example `{chat}_{msg_id}_{filename}`
+- `--output-layout <flat|chat|date|media-type>`: place downloads into layout-specific subdirectories
+- `--suffix-existing`: keep existing files and choose a suffixed destination name
+- `--metadata-sidecar`: write a JSON metadata sidecar next to each downloaded file
+- `--caption-sidecar <txt|json>`: write caption text to a sidecar file when present
+- `--hash`: compute a SHA-256 digest for each completed download
+- `--redownload-on-mismatch`: retry from scratch if the final file size does not match Telegram's reported size
+- `--print-path-only`: print only resolved output path(s) for successful or planned items
 - `--parallel-chunks <N>`: number of parallel chunk workers for large-file downloads
 - `--keep-partial`: keep `.part` files after download errors or timeouts
 - `--request-timeout-ms <MS>`: timeout for individual network requests
@@ -282,8 +319,21 @@ Notes:
 - `--file` conflicts with `LINK`, `--peer`, and `--msg`
 - `--retry-from` conflicts with `LINK`, `--peer`, `--msg`, and `--file`
 - default output directory is `./downloads`
-- `--skip-existing`, `--overwrite`, and `--resume` are mutually exclusive
-- `--checkpoint` is valid with `--file` and `--retry-from`
+- `--skip-existing`, `--overwrite`, `--resume`, and `--suffix-existing` are mutually exclusive
+- `--checkpoint` is valid with `--file`, stdin batch input, and `--retry-from`
+- `--continue-on-error` is the default batch behavior; `--fail-fast` makes the stop condition explicit
+- `--from-line` and `--to-line` apply to physical input lines and are valid with `--file` or stdin batch input
+- `--file -` or piping to `tw-dl download` reads batch input from stdin
+- hooks receive JSON in `TW_DL_EVENT_JSON` and on stdin, with `TW_DL_COMMAND`, `TW_DL_EVENT`, and `TW_DL_SCHEMA_VERSION` also set
+- `--archive` writes one JSONL record per processed item using the same stable schema version as stdout
+- grouped Telegram messages and albums are downloaded as multiple output items when media is available
+- `--name-template` supports `{chat}`, `{chat_id}`, `{msg_id}`, `{filename}`, `{media_type}`, and `{date}`
+- `--output-layout chat` uses a chat-derived directory name; `date` uses `YYYY-MM-DD`; `media-type` uses values such as `photo` or `document`
+- `--metadata-sidecar` writes a `.json` file with message, chat, sender, caption, mime type, and source-link metadata
+- `--caption-sidecar txt` writes `<filename>.txt`; `--caption-sidecar json` writes `<filename>.caption.json`
+- `--hash` adds a SHA-256 digest to the output payload after the file is written
+- size verification runs after download; `--redownload-on-mismatch` retries once from scratch on a truncated or mismatched file
+- `--print-path-only` suppresses structured stdout and prints only file paths, one per line
 - `--parallel-chunks` is most useful for large fresh downloads; resumed partial files continue with the sequential resume path
 - `--keep-partial` is useful with `--item-timeout-ms` or aggressive retry settings when you want to inspect or resume partial results later
 - bare numeric `--peer` values are accepted but less safe than full Telegram links or `@username` targets
@@ -336,6 +386,26 @@ tw-dl doctor
 Options:
 
 - `--session-path <FILE>`: path to the session file
+
+### `completions`
+
+Generate shell completion scripts.
+
+```bash
+tw-dl completions bash
+tw-dl completions zsh
+tw-dl completions fish
+tw-dl completions powershell
+```
+
+### `manifest`
+
+Import or export checkpoint and manifest files.
+
+```bash
+tw-dl manifest export --input ./links.checkpoint.jsonl --output ./links.checkpoint.json
+tw-dl manifest import --input ./links.checkpoint.json --output ./links.imported.jsonl
+```
 
 ## Download Examples
 
@@ -410,6 +480,40 @@ tw-dl download \
   --batch-timeout-ms 7200000
 ```
 
+Batch download with structured logs, hooks, and an archive:
+
+```bash
+tw-dl download \
+  --file links.txt \
+  --log-file ./tw-dl.log.jsonl \
+  --archive ./downloads.archive.jsonl \
+  --success-hook 'jq -r .data.file >/dev/null' \
+  --failure-hook 'cat >/dev/stderr'
+```
+
+Batch download with fail-fast behavior and a failure cap:
+
+```bash
+tw-dl download \
+  --file links.txt \
+  --jobs 4 \
+  --fail-fast \
+  --max-failures 1
+```
+
+Process only a slice of a large batch file:
+
+```bash
+tw-dl download --file links.txt --from-line 1001 --to-line 1500 --resume
+```
+
+Read batch input from stdin:
+
+```bash
+cat links.txt | tw-dl download --resume --jobs 4
+cat links.csv | tw-dl download --input-format csv --checkpoint ./stdin.checkpoint.jsonl
+```
+
 Skip existing completed files:
 
 ```bash
@@ -464,6 +568,21 @@ Example `links.txt`:
 https://t.me/channelname/101
 https://t.me/channelname/102
 https://t.me/c/1234567890/15
+```
+
+Example `links.csv`:
+
+```csv
+link,label
+https://t.me/channelname/101,first
+https://t.me/channelname/102,second
+```
+
+Example `links.jsonl`:
+
+```jsonl
+"https://t.me/channelname/101"
+{"link":"https://t.me/channelname/102"}
 ```
 
 Use a custom session:
@@ -541,14 +660,19 @@ Successful downloads print JSON to stdout, for example:
 
 ```json
 {
-  "message_id": 42,
-  "mime_type": "video/mp4",
-  "peer_id": -1001234567890,
-  "file": "downloads/video.mp4",
-  "filename": "video.mp4",
-  "resumed": false,
-  "size": 104857600,
-  "status": "downloaded"
+  "command": "download",
+  "data": {
+    "canonical_source_link": "https://t.me/mychannel/42",
+    "file": "downloads/video.mp4",
+    "filename": "video.mp4",
+    "message_id": 42,
+    "mime_type": "video/mp4",
+    "peer_id": -1001234567890,
+    "resumed": false,
+    "size": 104857600,
+    "status": "downloaded"
+  },
+  "schema_version": 1
 }
 ```
 
@@ -556,6 +680,13 @@ This makes the tool easy to use both interactively and from scripts.
 
 Batch runs also print one JSON object per processed item to stdout and append progress records to the checkpoint JSONL file when `--file` is used.
 Dry runs also print JSON, but with `"status": "planned"` and a collision preview instead of downloading files.
+Structured logs and archives are written as JSONL with the same schema version so automation can reuse one parser across stdout, logs, and archive files.
+
+Stable JSON envelope:
+
+- `schema_version`: current machine-readable schema version
+- `command`: logical command or event producer such as `download` or `inspect`
+- `data`: command-specific payload
 
 For scripting, `tw-dl` now returns different non-zero exit codes for common failure classes:
 
@@ -569,28 +700,33 @@ For scripting, `tw-dl` now returns different non-zero exit codes for common fail
 
 ```json
 {
-  "date": "2026-04-16T08:54:31+00:00",
-  "has_media": true,
-  "id": 42,
-  "media": {
-    "filename": "video.mp4",
-    "id": 1234567890123456789,
-    "mime_type": "video/mp4",
-    "size": 104857600,
-    "type": "document"
+  "command": "inspect",
+  "data": {
+    "canonical_source_link": "https://t.me/mychannel/42",
+    "date": "2026-04-16T08:54:31+00:00",
+    "has_media": true,
+    "id": 42,
+    "media": {
+      "filename": "video.mp4",
+      "id": 1234567890123456789,
+      "mime_type": "video/mp4",
+      "size": 104857600,
+      "type": "document"
+    },
+    "peer": {
+      "id": -1001234567890,
+      "name": "My Channel",
+      "type": "channel",
+      "username": "mychannel",
+      "usernames": [
+        "mychannel"
+      ]
+    },
+    "peer_id": -1001234567890,
+    "sender": null,
+    "text": "Episode 42"
   },
-  "peer": {
-    "id": -1001234567890,
-    "name": "My Channel",
-    "type": "channel",
-    "username": "mychannel",
-    "usernames": [
-      "mychannel"
-    ]
-  },
-  "peer_id": -1001234567890,
-  "sender": null,
-  "text": "Episode 42"
+  "schema_version": 1
 }
 ```
 

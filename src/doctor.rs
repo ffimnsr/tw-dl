@@ -124,9 +124,9 @@ pub async fn cmd_doctor(config_path: PathBuf, session_path: PathBuf) -> Result<(
         "missing"
     };
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
+    crate::output::write_command_output(
+        "doctor",
+        json!({
             "config": config_report,
             "environment": {
                 "telegram_api_id_source": api_id_source,
@@ -145,8 +145,8 @@ pub async fn cmd_doctor(config_path: PathBuf, session_path: PathBuf) -> Result<(
             },
             "authorization": auth_report,
             "healthy": loaded_config.is_ok() && api_id.is_some() && api_hash_present,
-        }))?
-    );
+        }),
+    )?;
 
     Ok(())
 }
