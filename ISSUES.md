@@ -78,6 +78,9 @@ The list is intentionally descriptive so it can serve as both a roadmap and an i
 - [x] Add progress metrics like throughput, ETA stability, retry count, and backoff state.
 - [x] Add optional parallel chunk downloading if the Telegram client layer supports it safely.
 - [x] Avoid repeated metadata fetches when multiple batch items target the same peer.
+- [ ] Stream batch input parsing instead of loading the full file or stdin into memory before scheduling work.
+- [ ] Make batch prefetch more incremental so large runs can start downloading sooner instead of waiting for all message metadata lookups up front.
+- [ ] Add lightweight benchmarks or profiling fixtures for batch parsing, metadata prefetch, and large-file download paths.
 
 ## Filtering and Selection
 
@@ -99,6 +102,13 @@ The list is intentionally descriptive so it can serve as both a roadmap and an i
 - [x] Add export/import support for manifests and checkpoints.
 - [x] Emit canonical source links in manifests and output where possible.
 - [x] Split reusable logic into a library crate so other Rust tools can integrate with `tw-dl`.
+- [ ] Add archive-aware skip mode so previously downloaded items can be skipped across separate runs, not only within the current checkpoint file.
+
+## Sync and Automation
+
+- [ ] Add `sync --peer <chat>` to mirror new media incrementally from a chat using a saved cursor or state file.
+- [ ] Add `watch --peer <chat>` for long-running polling/downloading of newly posted media with existing filters and naming rules.
+- [ ] Add `download --latest <N>` and cursor-style selectors such as `--after-msg <id>` / `--before-msg <id>` so users do not need to enumerate links manually for common workflows.
 
 ## Safety and UX
 
@@ -110,6 +120,7 @@ The list is intentionally descriptive so it can serve as both a roadmap and an i
 - [x] Add `--dry-run` to resolve and inspect targets without downloading.
 - [x] Add `--yes` for future non-interactive flows that may otherwise prompt.
 - [x] Expand help text and examples for private links, batch checkpoints, retries, and profile-based usage.
+- [ ] Make the default output mode TTY-aware so interactive use prefers concise human output while non-interactive use keeps stable JSON.
 
 ## Testing and Quality
 
@@ -118,3 +129,5 @@ The list is intentionally descriptive so it can serve as both a roadmap and an i
 - [ ] Add tests for interrupted download recovery and resume behavior across multiple retries.
 - [ ] Add golden tests for JSON output stability.
 - [ ] Add CI checks for `cargo clippy` and cross-platform filename behavior.
+- [ ] Split `src/download.rs` into smaller modules such as batch, resolve, transfer, and output-path handling so the download pipeline is easier to test and maintain.
+- [ ] Add regression tests for `doctor` health reporting and output-mode selection.

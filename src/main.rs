@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Generator, Shell};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tw_dl::{auth, config, doctor, download, manifest, output, session};
@@ -351,8 +352,11 @@ async fn run(cli: Cli) -> Result<()> {
         output::OutputSettings {
             mode: if cli.human {
                 output::OutputMode::Human
+            } else if cli.json {
+                output::OutputMode::Json
+            } else if std::io::stdout().is_terminal() {
+                output::OutputMode::Human
             } else {
-                let _ = cli.json;
                 output::OutputMode::Json
             },
             quiet: cli.quiet,

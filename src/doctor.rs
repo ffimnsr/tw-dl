@@ -144,7 +144,10 @@ pub async fn cmd_doctor(config_path: PathBuf, session_path: PathBuf) -> Result<(
                 "api_hash_present": api_hash_present,
             },
             "authorization": auth_report,
-            "healthy": loaded_config.is_ok() && api_id.is_some() && api_hash_present,
+            "healthy": loaded_config.is_ok()
+                && api_id.is_some()
+                && api_hash_present
+                && auth_report.get("authorized").and_then(|v| v.as_bool()).unwrap_or(false),
         }),
     )?;
 
