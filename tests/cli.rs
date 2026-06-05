@@ -174,3 +174,17 @@ fn test_completions_powershell_cli() {
     assert!(stdout.contains("Register-ArgumentCompleter"));
     assert!(stdout.contains("-CommandName 'tw-dl'"));
 }
+
+#[test]
+fn test_download_help_mentions_include_comments() {
+    let result = Command::new(bin_path())
+        .args(["download", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(result.status.success(), "{:?}", result);
+
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("--include-comments"));
+    assert!(stdout.contains("replies/comments in the message thread"));
+}

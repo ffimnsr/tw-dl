@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use grammers_client::message::Message;
 use grammers_client::peer::Peer;
+use grammers_client::tl;
 use grammers_session::types::PeerRef;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -25,6 +26,7 @@ pub(crate) struct MessageSelectorArgs {
     pub(crate) link: Option<String>,
     pub(crate) peer: Option<String>,
     pub(crate) msg_id: Option<i32>,
+    pub(crate) include_comments: bool,
 }
 
 pub(crate) fn warn_about_ambiguous_selector(selector: &MessageSelectorArgs) {
@@ -82,13 +84,209 @@ pub(crate) async fn fetch_messages_with_retry(
     caches: &DownloadCaches,
 ) -> Result<Vec<Message>> {
     let (peer_spec, msg_id) = resolve_peer_msg(selector)?;
-    let message = retry_fetch_message(client, &peer_spec, msg_id, retry, timeouts, caches).await?;
+    let mut messages = fetch_anchor_messages(client, &peer_spec, msg_id, retry, timeouts, caches)
+        .await?;
+
+    if selector.include_comments {
+        let reply_messages =
+            fetch_comment_messages(client, &peer_spec, msg_id, retry, timeouts, caches).await?;
+        messages.extend(reply_messages);
+        messages.sort_by_key(Message::id);
+        messages.dedup_by_key(|message| message.id());
+    }
+
+    Ok(messages)
+}
+
+async fn fetch_anchor_messages(
+    client: &ResilientClient,
+    peer_spec: &PeerSpec,
+    msg_id: i32,
+    retry: RetryConfig,
+    timeouts: TimeoutConfig,
+    caches: &DownloadCaches,
+) -> Result<Vec<Message>> {
+    let message = retry_fetch_message(client, peer_spec, msg_id, retry, timeouts, caches).await?;
     if let Some(grouped_id) = message.grouped_id() {
-        return fetch_grouped_messages(client, &peer_spec, msg_id, grouped_id, timeouts, caches)
+        return fetch_grouped_messages(client, peer_spec, msg_id, grouped_id, timeouts, caches)
             .await;
     }
 
     Ok(vec![message])
+}
+
+async fn fetch_comment_messages(
+    client: &ResilientClient,
+    peer_spec: &PeerSpec,
+    msg_id: i32,
+    retry: RetryConfig,
+    timeouts: TimeoutConfig,
+    caches: &DownloadCaches,
+) -> Result<Vec<Message>> {
+    let peer_ref = resolve_peer_ref(client, peer_spec, timeouts, caches).await?;
+    let reply_ids = retry_fetch_reply_ids(client, peer_ref, msg_id, retry, timeouts).await?;
+    if reply_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let reply_peer_ref = match resolve_comment_peer_ref(client, peer_ref, msg_id, timeouts).await {
+        Ok(reply_peer_ref) => reply_peer_ref,
+        Err(_) => peer_ref,
+    };
+    fetch_messages_by_ids(client, reply_peer_ref, &reply_ids, timeouts).await
+}
+
+async fn retry_fetch_reply_ids(
+    client: &ResilientClient,
+    peer_ref: PeerRef,
+    msg_id: i32,
+    retry: RetryConfig,
+    timeouts: TimeoutConfig,
+) -> Result<Vec<i32>> {
+    let mut attempt = 0u32;
+
+    loop {
+        match fetch_reply_ids_once(client, peer_ref, msg_id, timeouts).await {
+            Ok(ids) => return Ok(ids),
+            Err(error) => {
+                attempt += 1;
+                if let Some(delay) = retryable_delay(&error, attempt, retry) {
+                    prepare_retry(client, &error, delay).await?;
+                    crate::output::stderrln(format!(
+                        "Retrying comment fetch after error (attempt {}/{}): {}",
+                        attempt, retry.retries, error
+                    ));
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn fetch_reply_ids_once(
+    client: &ResilientClient,
+    peer_ref: PeerRef,
+    msg_id: i32,
+    timeouts: TimeoutConfig,
+) -> Result<Vec<i32>> {
+    let mut offset_id = 0;
+    let mut offset_date = 0;
+    let mut reply_ids = Vec::new();
+
+    loop {
+        client.wait_for_pacing().await;
+        let current_client = client.client().await;
+        let response = run_request(
+            timeouts.request_timeout,
+            "Comment thread request timed out",
+            current_client.invoke(&tl::functions::messages::GetReplies {
+                peer: peer_ref.into(),
+                msg_id,
+                offset_id,
+                offset_date,
+                add_offset: 0,
+                limit: 100,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            }),
+        )
+        .await
+        .with_context(|| format!("Failed to fetch comments for message id={}", msg_id))??;
+
+        let batch = raw_message_ids(response);
+        if batch.is_empty() {
+            break;
+        }
+
+        offset_id = *batch.last().expect("checked above");
+        offset_date = 0;
+        reply_ids.extend(batch);
+    }
+
+    reply_ids.sort_unstable();
+    reply_ids.dedup();
+    Ok(reply_ids)
+}
+
+async fn resolve_comment_peer_ref(
+    client: &ResilientClient,
+    peer_ref: PeerRef,
+    msg_id: i32,
+    timeouts: TimeoutConfig,
+) -> Result<PeerRef> {
+    client.wait_for_pacing().await;
+    let current_client = client.client().await;
+    let response = run_request(
+        timeouts.request_timeout,
+        "Discussion lookup timed out",
+        current_client.invoke(&tl::functions::messages::GetDiscussionMessage {
+            peer: peer_ref.into(),
+            msg_id,
+        }),
+    )
+    .await
+    .with_context(|| format!("Failed to resolve discussion for message id={}", msg_id))??;
+
+    let tl::enums::messages::DiscussionMessage::Message(discussion) = response;
+
+    for chat in discussion.chats {
+        let peer = Peer::from_raw(&current_client, chat);
+        if let Some(reply_peer_ref) = peer.to_ref().await {
+            if reply_peer_ref.id != peer_ref.id {
+                return Ok(reply_peer_ref);
+            }
+        }
+    }
+
+    Ok(peer_ref)
+}
+
+async fn fetch_messages_by_ids(
+    client: &ResilientClient,
+    peer_ref: PeerRef,
+    ids: &[i32],
+    timeouts: TimeoutConfig,
+) -> Result<Vec<Message>> {
+    let mut messages = Vec::new();
+
+    for chunk in ids.chunks(100) {
+        client.wait_for_pacing().await;
+        let current_client = client.client().await;
+        let batch = run_request(
+            timeouts.request_timeout,
+            "Message request timed out",
+            current_client.get_messages_by_id(peer_ref, chunk),
+        )
+        .await
+        .with_context(|| format!("Failed to fetch {} comment messages", chunk.len()))??;
+        messages.extend(batch.into_iter().flatten());
+    }
+
+    messages.sort_by_key(Message::id);
+    messages.dedup_by_key(|message| message.id());
+    Ok(messages)
+}
+
+fn raw_message_ids(messages: tl::enums::messages::Messages) -> Vec<i32> {
+    use tl::enums::messages::Messages;
+
+    let messages = match messages {
+        Messages::Messages(result) => result.messages,
+        Messages::Slice(result) => result.messages,
+        Messages::ChannelMessages(result) => result.messages,
+        Messages::NotModified(_) => Vec::new(),
+    };
+
+    messages
+        .into_iter()
+        .filter_map(|message| match message {
+            tl::enums::Message::Empty(_) => None,
+            tl::enums::Message::Message(message) => Some(message.id),
+            tl::enums::Message::Service(message) => Some(message.id),
+        })
+        .collect()
 }
 
 async fn fetch_grouped_messages(
@@ -393,6 +591,7 @@ pub(crate) async fn prefetch_messages_for_entries(
             link: Some(entry.link.clone()),
             peer: None,
             msg_id: None,
+            include_comments: false,
         };
         if let Ok((peer_spec, msg_id)) = resolve_peer_msg(&selector) {
             grouped.entry(peer_spec).or_default().push(msg_id);
@@ -449,6 +648,7 @@ pub(crate) async fn resolve_target(
             link: Some(trimmed.to_string()),
             peer: None,
             msg_id: None,
+            include_comments: false,
         };
         let (peer_spec, msg_id) = resolve_peer_msg(&selector)?;
         let message =

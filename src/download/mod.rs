@@ -123,6 +123,7 @@ pub async fn cmd_download(
                 ManifestReplayContext {
                     manifest_path: retry_from.clone(),
                     out_dir: args.out_dir.clone(),
+                    include_comments: args.include_comments,
                     collision: args.collision,
                     retry: args.retry,
                     jobs: args.jobs,
@@ -155,6 +156,7 @@ pub async fn cmd_download(
                 BatchContext {
                     source,
                     out_dir: args.out_dir.clone(),
+                    include_comments: args.include_comments,
                     collision: args.collision,
                     retry: args.retry,
                     jobs: args.jobs,
@@ -192,6 +194,7 @@ pub async fn cmd_download(
                     link: args.link,
                     peer: args.peer,
                     msg_id: args.msg_id,
+                    include_comments: args.include_comments,
                 },
                 out_dir: args.out_dir,
                 collision: args.collision,
@@ -268,6 +271,7 @@ pub async fn cmd_inspect(
             link: args.link,
             peer: args.peer,
             msg_id: args.msg_id,
+            include_comments: false,
         },
         RetryConfig::default(),
         TimeoutConfig::default(),

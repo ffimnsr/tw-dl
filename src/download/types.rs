@@ -7,6 +7,7 @@ pub struct DownloadArgs {
     pub link: Option<String>,
     pub peer: Option<String>,
     pub msg_id: Option<i32>,
+    pub include_comments: bool,
     pub out_dir: PathBuf,
     pub file_list: Option<PathBuf>,
     pub collision: CollisionPolicy,

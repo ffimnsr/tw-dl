@@ -139,6 +139,10 @@ enum Commands {
         #[arg(long, value_name = "ID", requires = "peer", conflicts_with = "file")]
         msg: Option<i32>,
 
+        /// Also download media from replies/comments in the message thread.
+        #[arg(long)]
+        include_comments: bool,
+
         /// File containing batch input. Use "-" to read from stdin.
         #[arg(long, short = 'f', value_name = "FILE", conflicts_with_all = ["link", "peer", "msg"])]
         file: Option<PathBuf>,
@@ -399,6 +403,7 @@ async fn run(cli: Cli) -> Result<()> {
             link,
             peer,
             msg,
+            include_comments,
             file,
             out,
             skip_existing,
@@ -444,6 +449,7 @@ async fn run(cli: Cli) -> Result<()> {
                     link,
                     peer,
                     msg_id: msg,
+                    include_comments,
                     out_dir: out,
                     file_list: file,
                     collision: download::CollisionPolicy::from_flags(

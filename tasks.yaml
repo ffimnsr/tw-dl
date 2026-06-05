@@ -1,4 +1,8 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/ffimnsr/mk-rs/main/docs/schema.json
 
 use_cargo: true
-tasks: {}
+tasks:
+  install:
+    commands:
+      - cargo install --path . --locked
+    description: Install the package

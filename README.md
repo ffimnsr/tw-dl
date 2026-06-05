@@ -20,6 +20,7 @@ It signs in as your normal Telegram account and can download media from chats, c
 - Supports checkpoint manifests for large batch runs
 - Supports manifest export/import for checkpoints and batch results
 - Supports grouped-message and album downloads
+- Supports optional reply/comment-thread media downloads with `--include-comments`
 - Supports media selection with `--media-variant`
 - Supports templated filenames and output subdirectories
 - Supports metadata, caption, and hashing sidecars for downloaded files
@@ -52,6 +53,7 @@ cp .env.example .env
 
 ./target/release/tw-dl login
 ./target/release/tw-dl download https://t.me/channelname/123
+./target/release/tw-dl download --include-comments https://t.me/channelname/123
 ```
 
 ## Requirements
@@ -77,8 +79,12 @@ The compiled binary will be available at:
 Optional global install:
 
 ```bash
-cargo install --path .
+cargo install --path . --locked
 ```
+
+`--locked` is currently required because the `grammers` dependency chain resolves
+through a yanked `glass_pumpkin` release during fresh dependency resolution.
+This repository's checked-in `Cargo.lock` still installs correctly.
 
 ## Configuration
 
