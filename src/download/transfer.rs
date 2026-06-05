@@ -1042,7 +1042,10 @@ pub(crate) async fn resolve_download_target(
     )))
 }
 
-fn resolve_download_source(message: &Message, media_variant: MediaVariant) -> Option<DownloadSource> {
+fn resolve_download_source(
+    message: &Message,
+    media_variant: MediaVariant,
+) -> Option<DownloadSource> {
     match message.media()? {
         Media::Document(doc) => {
             if matches!(media_variant, MediaVariant::LargestPhoto) {

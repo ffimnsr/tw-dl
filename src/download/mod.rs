@@ -39,9 +39,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use batch::{
-    BatchContext, ManifestReplayContext, BatchLineRange, checkpoint_path_for,
-    checkpoint_path_for_batch_source, emit_download_result, maybe_archive_result,
-    resolve_batch_source, run_batch_downloads, run_manifest_replay,
+    checkpoint_path_for, checkpoint_path_for_batch_source, emit_download_result,
+    maybe_archive_result, resolve_batch_source, run_batch_downloads, run_manifest_replay,
+    BatchContext, BatchLineRange, ManifestReplayContext,
 };
 use client::{DownloadCaches, ResilientClient};
 use describe::{describe_message, peer_kind_name};

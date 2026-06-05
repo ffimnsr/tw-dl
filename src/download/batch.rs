@@ -18,16 +18,16 @@ use tokio::fs;
 use tokio::io::{self, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::task::JoinSet;
 
-use crate::link::parse_link;
-use crate::manifest::{
-    append_manifest_record, open_manifest_writer, read_manifest_records, ManifestRecord,
-};
 use super::client::{DownloadCaches, ResilientClient};
-use super::transfer::{download_one, SingleDownloadRequest};
 use super::resolver::MessageSelectorArgs;
+use super::transfer::{download_one, SingleDownloadRequest};
 use super::types::{
     BatchFailureMode, BatchInputFormat, CaptionSidecarFormat, CollisionPolicy, MediaVariant,
     OutputLayout, RetryConfig, TimeoutConfig,
+};
+use crate::link::parse_link;
+use crate::manifest::{
+    append_manifest_record, open_manifest_writer, read_manifest_records, ManifestRecord,
 };
 
 // ── batch source types ─────────────────────────────────────────────────────────
@@ -184,7 +184,9 @@ struct BatchResultContext<'a> {
 
 // ── batch source helpers ───────────────────────────────────────────────────────
 
-pub(crate) fn resolve_batch_source(args: &super::types::DownloadArgs) -> Result<Option<BatchSource>> {
+pub(crate) fn resolve_batch_source(
+    args: &super::types::DownloadArgs,
+) -> Result<Option<BatchSource>> {
     if let Some(path) = &args.file_list {
         return Ok(Some(if path == Path::new("-") {
             BatchSource::Stdin
@@ -410,7 +412,9 @@ fn parse_line(
             let row = match parse_csv_record(trimmed) {
                 Ok(row) => row,
                 Err(e) => {
-                    return Some(Err(e.context(format!("Invalid CSV row at line {}", line_number))))
+                    return Some(Err(
+                        e.context(format!("Invalid CSV row at line {}", line_number))
+                    ))
                 }
             };
             if !*csv_header_processed {
@@ -425,7 +429,8 @@ fn parse_line(
                     return None; // header row — skip
                 }
             }
-            extract_csv_link(&row, *csv_selected_column).map(|link| Ok(BatchEntry { line_number, link }))
+            extract_csv_link(&row, *csv_selected_column)
+                .map(|link| Ok(BatchEntry { line_number, link }))
         }
         BatchInputFormat::Jsonl => {
             let trimmed = text.trim();
@@ -542,10 +547,7 @@ struct SourceLine {
 }
 
 #[cfg(test)]
-fn parse_text_batch_entries(
-    lines: &[SourceLine],
-    line_range: BatchLineRange,
-) -> Vec<BatchEntry> {
+fn parse_text_batch_entries(lines: &[SourceLine], line_range: BatchLineRange) -> Vec<BatchEntry> {
     lines
         .iter()
         .filter(|line| line_range.contains(line.line_number))
@@ -663,8 +665,7 @@ pub(crate) async fn run_batch_downloads(
     shutdown: Arc<AtomicBool>,
     caches: Arc<DownloadCaches>,
 ) -> Result<()> {
-    let entries_rx =
-        spawn_batch_entry_stream(ctx.source, ctx.input_format, ctx.line_range);
+    let entries_rx = spawn_batch_entry_stream(ctx.source, ctx.input_format, ctx.line_range);
 
     run_link_jobs(LinkJobContext {
         client,

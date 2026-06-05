@@ -8,10 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::link::{parse_link, ParsedLink};
-use super::client::{DownloadCaches, MessageCacheKey, ResilientClient, run_request};
+use super::client::{run_request, DownloadCaches, MessageCacheKey, ResilientClient};
 use super::retry::{prepare_retry, retryable_delay};
 use super::types::{RetryConfig, TimeoutConfig};
+use crate::link::{parse_link, ParsedLink};
 
 const GROUP_FETCH_WINDOW: i32 = 64;
 
@@ -84,8 +84,8 @@ pub(crate) async fn fetch_messages_with_retry(
     caches: &DownloadCaches,
 ) -> Result<Vec<Message>> {
     let (peer_spec, msg_id) = resolve_peer_msg(selector)?;
-    let mut messages = fetch_anchor_messages(client, &peer_spec, msg_id, retry, timeouts, caches)
-        .await?;
+    let mut messages =
+        fetch_anchor_messages(client, &peer_spec, msg_id, retry, timeouts, caches).await?;
 
     if selector.include_comments {
         let reply_messages =
