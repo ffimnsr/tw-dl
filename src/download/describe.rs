@@ -44,7 +44,7 @@ pub(crate) fn describe_messages(messages: &[Message], anchor_msg_id: Option<i32>
         let text_empty = map
             .get("text")
             .and_then(Value::as_str)
-            .map_or(true, str::is_empty);
+            .is_none_or(str::is_empty);
         if text_empty {
             if let Some(other_text) = messages.iter().find_map(|m| {
                 let t = m.text();

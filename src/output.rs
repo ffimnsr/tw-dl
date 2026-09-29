@@ -280,7 +280,7 @@ fn write_human_inspect(data: &Value) -> Result<()> {
 
         for (idx, msg) in messages.iter().enumerate() {
             let msg_id = msg.get("id").and_then(Value::as_i64).unwrap_or(0);
-            let is_requested = requested_id.map_or(false, |rid| rid == msg_id);
+            let is_requested = requested_id == Some(msg_id);
             let req_indicator = if is_requested { " [requested]" } else { "" };
 
             println!(

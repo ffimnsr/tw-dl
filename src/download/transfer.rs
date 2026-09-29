@@ -269,7 +269,11 @@ pub(crate) async fn download_media(
         items.push(item);
     }
 
-    if !items.is_empty() && items.iter().all(|item| item.get("status").and_then(Value::as_str) == Some("failed")) {
+    if !items.is_empty()
+        && items
+            .iter()
+            .all(|item| item.get("status").and_then(Value::as_str) == Some("failed"))
+    {
         if let Some(err) = first_error {
             return Err(err);
         }
@@ -413,7 +417,7 @@ pub(crate) fn summarize_download_items(
         "skipped"
     } else if all_statuses.iter().all(|s| *s == "failed") {
         "failed"
-    } else if all_statuses.iter().any(|s| *s == "failed") {
+    } else if all_statuses.contains(&"failed") {
         "partial"
     } else {
         "downloaded"

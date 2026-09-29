@@ -277,10 +277,14 @@ pub async fn cmd_inspect(
         no_album: args.no_album,
     };
     let anchor_msg_id = selector.msg_id.or_else(|| {
-        selector.link.as_deref().and_then(|l| crate::link::parse_link(l).ok()).map(|parsed| match parsed {
-            crate::link::ParsedLink::Username { msg_id, .. } => msg_id,
-            crate::link::ParsedLink::Channel { msg_id, .. } => msg_id,
-        })
+        selector
+            .link
+            .as_deref()
+            .and_then(|l| crate::link::parse_link(l).ok())
+            .map(|parsed| match parsed {
+                crate::link::ParsedLink::Username { msg_id, .. } => msg_id,
+                crate::link::ParsedLink::Channel { msg_id, .. } => msg_id,
+            })
     });
 
     let messages = fetch_messages_with_retry(

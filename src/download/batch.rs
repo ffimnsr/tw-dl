@@ -669,8 +669,7 @@ pub(crate) async fn run_batch_downloads(
     shutdown: Arc<AtomicBool>,
     caches: Arc<DownloadCaches>,
 ) -> Result<()> {
-    let entries_rx =
-        spawn_batch_entry_stream(ctx.source, ctx.input_format, ctx.line_range);
+    let entries_rx = spawn_batch_entry_stream(ctx.source, ctx.input_format, ctx.line_range);
 
     run_link_jobs(LinkJobContext {
         client,
