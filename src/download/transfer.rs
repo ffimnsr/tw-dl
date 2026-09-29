@@ -51,6 +51,7 @@ pub(crate) struct SingleDownloadRequest {
     pub(crate) parallel_chunks: usize,
     pub(crate) keep_partial: bool,
     pub(crate) timeouts: TimeoutConfig,
+    pub(crate) continue_on_error: bool,
 }
 
 // ── media types ────────────────────────────────────────────────────────────────
@@ -186,18 +187,76 @@ pub(crate) async fn download_media(
     shutdown: &AtomicBool,
 ) -> Result<Value> {
     let mut items = Vec::new();
+    let mut first_error: Option<anyhow::Error> = None;
+
     for message in messages {
-        let Some((target, source)) = resolve_download_target(request, message).await? else {
+        let resolved = match resolve_download_target(request, message).await {
+            Ok(res) => res,
+            Err(e) => {
+                if request.continue_on_error {
+                    crate::output::stderrln(format!(
+                        "Download error for message #{}: {:#}",
+                        message.id(),
+                        e
+                    ));
+                    items.push(json!({
+                        "status": "failed",
+                        "message_id": message.id(),
+                        "peer_id": message.peer_id().bot_api_dialog_id(),
+                        "canonical_source_link": canonical_source_link(message),
+                        "error": format!("{:#}", e),
+                    }));
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        let Some((target, source)) = resolved else {
             continue;
         };
-        let outcome = match &source {
+
+        let outcome_result = match &source {
             DownloadSource::Document(doc) => {
-                stream_download_verified(client, doc, &target, request, shutdown).await?
+                stream_download_verified(client, doc, &target, request, shutdown).await
             }
             DownloadSource::Photo(photo) => {
-                stream_download_verified(client, photo, &target, request, shutdown).await?
+                stream_download_verified(client, photo, &target, request, shutdown).await
             }
         };
+
+        let outcome = match outcome_result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                if request.continue_on_error {
+                    crate::output::stderrln(format!(
+                        "Download error for '{}': {:#}",
+                        target.out_path.display(),
+                        e
+                    ));
+                    items.push(json!({
+                        "status": "failed",
+                        "message_id": message.id(),
+                        "peer_id": message.peer_id().bot_api_dialog_id(),
+                        "canonical_source_link": target.canonical_source_link,
+                        "file": target.out_path.display().to_string(),
+                        "filename": target.filename,
+                        "error": format!("{:#}", e),
+                    }));
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
         let mut item = download_result_value(
             message,
             &target.out_path,
@@ -208,6 +267,12 @@ pub(crate) async fn download_media(
         );
         augment_item_result(&mut item, &target, message, request).await?;
         items.push(item);
+    }
+
+    if !items.is_empty() && items.iter().all(|item| item.get("status").and_then(Value::as_str) == Some("failed")) {
+        if let Some(err) = first_error {
+            return Err(err);
+        }
     }
 
     summarize_download_items(items, request)
@@ -332,7 +397,12 @@ pub(crate) fn summarize_download_items(
         bail!("No downloadable media matched the selected media variant");
     }
 
-    let first = items[0].clone();
+    let first_non_failed = items
+        .iter()
+        .find(|item| item.get("status").and_then(Value::as_str) != Some("failed"))
+        .unwrap_or(&items[0])
+        .clone();
+
     let all_statuses: Vec<&str> = items
         .iter()
         .filter_map(|item| item.get("status").and_then(Value::as_str))
@@ -341,11 +411,16 @@ pub(crate) fn summarize_download_items(
         "planned"
     } else if all_statuses.iter().all(|s| *s == "skipped") {
         "skipped"
+    } else if all_statuses.iter().all(|s| *s == "failed") {
+        "failed"
+    } else if all_statuses.iter().any(|s| *s == "failed") {
+        "partial"
     } else {
         "downloaded"
     };
     let files: Vec<Value> = items
         .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) != Some("failed"))
         .filter_map(|item| item.get("file").cloned())
         .collect();
 
@@ -367,7 +442,7 @@ pub(crate) fn summarize_download_items(
             "canonical_source_link",
             "grouped_id",
         ] {
-            if let Some(value) = first.get(key).cloned() {
+            if let Some(value) = first_non_failed.get(key).cloned() {
                 object.insert(key.to_string(), value);
             }
         }
@@ -1507,5 +1582,57 @@ mod tests {
 
         let _ = std::fs::remove_file(out_path);
         let _ = std::fs::remove_dir(base);
+    }
+    #[test]
+    fn test_summarize_download_items_partial_and_failed() {
+        let request = SingleDownloadRequest {
+            selector: MessageSelectorArgs {
+                link: None,
+                peer: None,
+                msg_id: None,
+                include_comments: false,
+                no_album: false,
+            },
+            out_dir: PathBuf::from("downloads"),
+            collision: CollisionPolicy::Error,
+            retry: RetryConfig::default(),
+            dry_run: false,
+            media_variant: MediaVariant::Auto,
+            name_template: None,
+            output_layout: OutputLayout::Flat,
+            metadata_sidecar: false,
+            caption_sidecar: None,
+            hash: false,
+            redownload_on_mismatch: false,
+            print_path_only: false,
+            parallel_chunks: 1,
+            keep_partial: false,
+            timeouts: TimeoutConfig::default(),
+            continue_on_error: true,
+        };
+
+        let items = vec![
+            json!({
+                "status": "downloaded",
+                "file": "downloads/item1.mp4",
+                "filename": "item1.mp4",
+                "message_id": 100,
+            }),
+            json!({
+                "status": "failed",
+                "file": "downloads/item2.mp4",
+                "filename": "item2.mp4",
+                "message_id": 101,
+                "error": "LOCATION_INVALID",
+            }),
+        ];
+
+        let summary = summarize_download_items(items, &request).unwrap();
+        assert_eq!(summary["status"], "partial");
+        assert_eq!(summary["item_count"], 2);
+        let files = summary["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], "downloads/item1.mp4");
+        assert_eq!(summary["file"], "downloads/item1.mp4");
     }
 }

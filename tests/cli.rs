@@ -188,3 +188,30 @@ fn test_download_help_mentions_include_comments() {
     assert!(stdout.contains("--include-comments"));
     assert!(stdout.contains("replies/comments in the message thread"));
 }
+
+#[test]
+fn test_download_help_mentions_no_album_and_continue_on_error() {
+    let result = Command::new(bin_path())
+        .args(["download", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(result.status.success(), "{:?}", result);
+
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("--no-album"));
+    assert!(stdout.contains("--continue-on-error"));
+}
+
+#[test]
+fn test_inspect_help_mentions_no_album() {
+    let result = Command::new(bin_path())
+        .args(["inspect", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(result.status.success(), "{:?}", result);
+
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("--no-album"));
+}

@@ -8,6 +8,7 @@ pub struct DownloadArgs {
     pub peer: Option<String>,
     pub msg_id: Option<i32>,
     pub include_comments: bool,
+    pub no_album: bool,
     pub out_dir: PathBuf,
     pub file_list: Option<PathBuf>,
     pub collision: CollisionPolicy,
@@ -15,6 +16,7 @@ pub struct DownloadArgs {
     pub jobs: usize,
     pub input_format: BatchInputFormat,
     pub failure_mode: BatchFailureMode,
+    pub continue_on_error: bool,
     pub max_failures: Option<usize>,
     pub from_line: Option<usize>,
     pub to_line: Option<usize>,
@@ -45,6 +47,7 @@ pub struct InspectArgs {
     pub link: Option<String>,
     pub peer: Option<String>,
     pub msg_id: Option<i32>,
+    pub no_album: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

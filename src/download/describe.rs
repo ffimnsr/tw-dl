@@ -13,10 +13,55 @@ pub(crate) fn describe_message(message: &Message) -> Value {
         "date": message.date().to_rfc3339(),
         "text": message.text(),
         "has_media": message.media().is_some(),
+        "grouped_id": message.grouped_id(),
         "peer": peer,
         "sender": sender,
         "media": message.media().map(|media| describe_media(&media)),
     })
+}
+
+pub(crate) fn describe_messages(messages: &[Message], anchor_msg_id: Option<i32>) -> Value {
+    if messages.is_empty() {
+        return json!({});
+    }
+
+    let items: Vec<Value> = messages.iter().map(describe_message).collect();
+
+    let anchor_index = anchor_msg_id
+        .and_then(|id| messages.iter().position(|m| m.id() == id))
+        .unwrap_or(0);
+
+    let mut base = items[anchor_index].clone();
+    if let Some(map) = base.as_object_mut() {
+        map.insert("item_count".to_string(), json!(messages.len()));
+        if let Some(gid) = messages[anchor_index]
+            .grouped_id()
+            .or_else(|| messages.iter().find_map(|m| m.grouped_id()))
+        {
+            map.insert("grouped_id".to_string(), json!(gid));
+        }
+
+        let text_empty = map
+            .get("text")
+            .and_then(Value::as_str)
+            .map_or(true, str::is_empty);
+        if text_empty {
+            if let Some(other_text) = messages.iter().find_map(|m| {
+                let t = m.text();
+                if !t.is_empty() {
+                    Some(t)
+                } else {
+                    None
+                }
+            }) {
+                map.insert("text".to_string(), json!(other_text));
+            }
+        }
+
+        map.insert("items".to_string(), json!(items.clone()));
+        map.insert("messages".to_string(), json!(items));
+    }
+    base
 }
 
 pub(crate) fn describe_peer(peer: &Peer) -> Value {

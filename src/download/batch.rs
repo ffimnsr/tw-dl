@@ -104,6 +104,7 @@ pub(crate) struct BatchContext {
     pub(crate) parallel_chunks: usize,
     pub(crate) keep_partial: bool,
     pub(crate) timeouts: TimeoutConfig,
+    pub(crate) no_album: bool,
 }
 
 pub(crate) struct ManifestReplayContext {
@@ -131,6 +132,7 @@ pub(crate) struct ManifestReplayContext {
     pub(crate) parallel_chunks: usize,
     pub(crate) keep_partial: bool,
     pub(crate) timeouts: TimeoutConfig,
+    pub(crate) no_album: bool,
 }
 
 struct LinkJobContext<'a> {
@@ -159,6 +161,7 @@ struct LinkJobContext<'a> {
     parallel_chunks: usize,
     keep_partial: bool,
     timeouts: TimeoutConfig,
+    no_album: bool,
     caches: Arc<DownloadCaches>,
     shutdown: Arc<AtomicBool>,
 }
@@ -171,12 +174,11 @@ struct BatchTaskResult {
 }
 
 struct BatchResultContext<'a> {
-    checkpoint_path: &'a Path,
+    _checkpoint_path: &'a Path,
     writer: &'a mut fs::File,
-    completed_links: &'a mut HashSet<String>,
     success_count: &'a mut usize,
     failure_count: &'a mut usize,
-    skipped_count: &'a mut usize,
+    dry_run: bool,
     success_hook: Option<&'a str>,
     failure_hook: Option<&'a str>,
     archive_path: Option<&'a Path>,
@@ -458,8 +460,7 @@ fn parse_line(
                         Some(s) => s,
                         None => {
                             return Some(Err(anyhow::anyhow!(
-                                "JSONL entry at line {} must be a string or object \
-                                 containing link/url/message_link/message_url",
+                                "JSONL entry at line {} must be a string or object containing link/url/message_link/message_url",
                                 line_number
                             )))
                         }
@@ -657,6 +658,9 @@ fn parse_jsonl_batch_entries(
 // ── batch run-level entry points ───────────────────────────────────────────────
 
 /// Run batch downloads, streaming source input rather than loading it all into
+/// memory.
+///
+/// Channel and peer references are cached across entries in shared thread-safe
 /// memory.  No upfront prefetch is performed; individual downloads fetch and
 /// cache their own messages, so large batches start immediately.
 pub(crate) async fn run_batch_downloads(
@@ -665,7 +669,8 @@ pub(crate) async fn run_batch_downloads(
     shutdown: Arc<AtomicBool>,
     caches: Arc<DownloadCaches>,
 ) -> Result<()> {
-    let entries_rx = spawn_batch_entry_stream(ctx.source, ctx.input_format, ctx.line_range);
+    let entries_rx =
+        spawn_batch_entry_stream(ctx.source, ctx.input_format, ctx.line_range);
 
     run_link_jobs(LinkJobContext {
         client,
@@ -693,6 +698,7 @@ pub(crate) async fn run_batch_downloads(
         parallel_chunks: ctx.parallel_chunks,
         keep_partial: ctx.keep_partial,
         timeouts: ctx.timeouts,
+        no_album: ctx.no_album,
         caches,
         shutdown,
     })
@@ -752,6 +758,7 @@ pub(crate) async fn run_manifest_replay(
         parallel_chunks: ctx.parallel_chunks,
         keep_partial: ctx.keep_partial,
         timeouts: ctx.timeouts,
+        no_album: ctx.no_album,
         caches,
         shutdown,
     })
@@ -787,11 +794,12 @@ async fn run_link_jobs(mut ctx: LinkJobContext<'_>) -> Result<()> {
         parallel_chunks,
         keep_partial,
         timeouts,
+        no_album,
         ref caches,
         ref shutdown,
     } = ctx;
 
-    let mut completed_links = load_completed_links(checkpoint_path).await?;
+    let completed_links = load_completed_links(checkpoint_path).await?;
     let mut writer = open_manifest_writer(checkpoint_path).await?;
     let mut join_set: JoinSet<BatchTaskResult> = JoinSet::new();
     let mut success_count = 0usize;
@@ -803,23 +811,37 @@ async fn run_link_jobs(mut ctx: LinkJobContext<'_>) -> Result<()> {
     let mut stop_scheduling = false;
     let client_handle = client.clone();
 
-    loop {
-        // Drain completed tasks whenever the pool is full or no more entries
-        // are being added to it.
+    while let Some(item) = entries.recv().await {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(e) => {
+                crate::output::stderrln(format!("Failed to parse batch entry: {:#}", e));
+                failure_count += 1;
+                if should_stop_batch(failure_mode, max_failures, failure_count) {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        // Drain tasks until we have room under the concurrency limit.
         while join_set.len() >= jobs {
-            let finished = join_set
-                .join_next()
-                .await
-                .expect("join set length checked")?;
+            let Some(task_result) = join_set.join_next().await else {
+                break;
+            };
+            let finished = task_result?;
             handle_batch_result(
                 finished,
                 BatchResultContext {
-                    checkpoint_path,
+                    _checkpoint_path: checkpoint_path,
                     writer: &mut writer,
-                    completed_links: &mut completed_links,
                     success_count: &mut success_count,
                     failure_count: &mut failure_count,
-                    skipped_count: &mut skipped_count,
+                    dry_run,
                     success_hook,
                     failure_hook,
                     archive_path,
@@ -832,37 +854,27 @@ async fn run_link_jobs(mut ctx: LinkJobContext<'_>) -> Result<()> {
             }
         }
 
-        if shutdown.load(Ordering::SeqCst) || stop_scheduling {
+        if stop_scheduling {
             break;
         }
 
-        // Pull the next entry from the stream.
-        let entry = match entries.recv().await {
-            Some(Ok(entry)) => entry,
-            Some(Err(e)) => return Err(e),
-            None => break, // stream exhausted
-        };
-
         let line_number = entry.line_number;
         let link = entry.link;
-        let link_key = normalize_link_key(&link);
+        let normalized = normalize_link_key(&link);
 
-        if completed_links.contains(&link_key) {
+        if completed_links.contains(&normalized) {
             checkpoint_skip_count += 1;
-            crate::output::stderrln(format!(
-                "[{}] Skipping completed checkpoint entry {}",
-                line_number, link
-            ));
             continue;
         }
 
-        if !seen_links.insert(link_key.clone()) {
+        if !seen_links.insert(normalized) {
             duplicate_skip_count += 1;
             let value = json!({
                 "status": "skipped",
-                "reason": "duplicate-input",
-                "input_line": line_number,
-                "link": link,
+                "canonical_source_link": link,
+                "reason": "duplicate input",
+                "line_number": line_number,
+                "print_path_only": print_path_only,
             });
             append_manifest_record(
                 &mut writer,
@@ -889,6 +901,7 @@ async fn run_link_jobs(mut ctx: LinkJobContext<'_>) -> Result<()> {
                 peer: None,
                 msg_id: None,
                 include_comments,
+                no_album,
             },
             out_dir: out_dir.to_path_buf(),
             collision,
@@ -905,6 +918,7 @@ async fn run_link_jobs(mut ctx: LinkJobContext<'_>) -> Result<()> {
             parallel_chunks,
             keep_partial,
             timeouts,
+            continue_on_error: matches!(failure_mode, BatchFailureMode::ContinueOnError),
         };
         let task_client = client_handle.clone();
         let task_shutdown = shutdown.clone();
@@ -924,12 +938,11 @@ async fn run_link_jobs(mut ctx: LinkJobContext<'_>) -> Result<()> {
         handle_batch_result(
             finished,
             BatchResultContext {
-                checkpoint_path,
+                _checkpoint_path: checkpoint_path,
                 writer: &mut writer,
-                completed_links: &mut completed_links,
                 success_count: &mut success_count,
                 failure_count: &mut failure_count,
-                skipped_count: &mut skipped_count,
+                dry_run,
                 success_hook,
                 failure_hook,
                 archive_path,
@@ -975,12 +988,11 @@ async fn run_link_jobs(mut ctx: LinkJobContext<'_>) -> Result<()> {
 
 async fn handle_batch_result(result: BatchTaskResult, ctx: BatchResultContext<'_>) -> Result<()> {
     let BatchResultContext {
-        checkpoint_path,
+        _checkpoint_path: _,
         writer,
-        completed_links,
         success_count,
         failure_count,
-        skipped_count,
+        dry_run,
         success_hook,
         failure_hook,
         archive_path,
@@ -991,34 +1003,34 @@ async fn handle_batch_result(result: BatchTaskResult, ctx: BatchResultContext<'_
             let status = value
                 .get("status")
                 .and_then(Value::as_str)
-                .unwrap_or("downloaded");
-            if status == "skipped" {
-                *skipped_count += 1;
-            } else {
-                *success_count += 1;
-                completed_links.insert(normalize_link_key(&result.link));
+                .unwrap_or("downloaded")
+                .to_string();
+            let file = value
+                .get("file")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let canonical = value
+                .get("canonical_source_link")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+
+            if !dry_run {
+                append_manifest_record(
+                    writer,
+                    &ManifestRecord {
+                        index: result.line_number,
+                        link: result.link.clone(),
+                        status: status.clone(),
+                        file,
+                        error: None,
+                        timestamp_unix: crate::output::unix_timestamp(),
+                        canonical_source_link: canonical,
+                    },
+                )
+                .await?;
             }
 
-            append_manifest_record(
-                writer,
-                &ManifestRecord {
-                    index: result.line_number,
-                    link: result.link,
-                    status: status.to_string(),
-                    file: value
-                        .get("file")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    error: None,
-                    timestamp_unix: crate::output::unix_timestamp(),
-                    canonical_source_link: value
-                        .get("canonical_source_link")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                },
-            )
-            .await?;
-
+            *success_count += 1;
             maybe_archive_result(archive_path, &value)?;
             crate::output::log_event("download", "item_completed", &value)?;
             crate::output::run_hook(success_hook, "download", "item_completed", &value).await?;
@@ -1026,38 +1038,28 @@ async fn handle_batch_result(result: BatchTaskResult, ctx: BatchResultContext<'_
         }
         Err(error) => {
             *failure_count += 1;
-            let rendered = format!("{:#}", error);
             let failure_value = json!({
                 "status": "failed",
-                "input_line": result.line_number,
-                "link": result.link.clone(),
-                "error": rendered,
+                "canonical_source_link": result.link,
+                "error": format!("{:#}", error),
+                "line_number": result.line_number,
             });
-            append_manifest_record(
-                writer,
-                &ManifestRecord {
-                    index: result.line_number,
-                    link: result.link.clone(),
-                    status: "failed".to_string(),
-                    file: None,
-                    error: Some(
-                        failure_value
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    ),
-                    timestamp_unix: crate::output::unix_timestamp(),
-                    canonical_source_link: None,
-                },
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to update checkpoint '{}'",
-                    checkpoint_path.display()
+
+            if !dry_run {
+                append_manifest_record(
+                    writer,
+                    &ManifestRecord {
+                        index: result.line_number,
+                        link: result.link.clone(),
+                        status: "failed".to_string(),
+                        file: None,
+                        error: Some(format!("{:#}", error)),
+                        timestamp_unix: crate::output::unix_timestamp(),
+                        canonical_source_link: None,
+                    },
                 )
-            })?;
+                .await?;
+            }
 
             crate::output::log_event("download", "item_failed", &failure_value)?;
             crate::output::run_hook(failure_hook, "download", "item_failed", &failure_value)
@@ -1094,6 +1096,9 @@ pub(crate) fn emit_download_result(value: &Value) -> Result<()> {
     {
         if let Some(items) = value.get("items").and_then(Value::as_array) {
             for item in items {
+                if item.get("status").and_then(Value::as_str) == Some("failed") {
+                    continue;
+                }
                 if let Some(path) = item.get("file").and_then(Value::as_str) {
                     println!("{}", path);
                 }
@@ -1116,7 +1121,10 @@ pub(crate) fn maybe_archive_result(path: Option<&Path>, value: &Value) -> Result
 
     crate::output::archive_append(
         path,
-        &crate::output::event_output("download", "archive_item", value.clone()),
+        &json!({
+            "timestamp_unix": crate::output::unix_timestamp(),
+            "item": value,
+        }),
     )
 }
 
@@ -1251,10 +1259,9 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_path_default() {
-        let list = Path::new("/tmp/links.txt");
+    fn test_checkpoint_path_derivation() {
         assert_eq!(
-            checkpoint_path_for(list, None),
+            checkpoint_path_for(Path::new("/tmp/links.txt"), None),
             PathBuf::from("/tmp/links.txt.checkpoint.jsonl")
         );
     }

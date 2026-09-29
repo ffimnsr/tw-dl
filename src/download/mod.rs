@@ -44,8 +44,8 @@ use batch::{
     BatchContext, BatchLineRange, ManifestReplayContext,
 };
 use client::{DownloadCaches, ResilientClient};
-use describe::{describe_message, peer_kind_name};
-use resolver::{fetch_message_with_retry, resolve_target, MessageSelectorArgs};
+use describe::peer_kind_name;
+use resolver::{fetch_messages_with_retry, resolve_target, MessageSelectorArgs};
 use transfer::{download_one, SingleDownloadRequest};
 use types::TimeoutConfig;
 
@@ -145,6 +145,7 @@ pub async fn cmd_download(
                     parallel_chunks: args.parallel_chunks,
                     keep_partial: args.keep_partial,
                     timeouts,
+                    no_album: args.no_album,
                 },
                 shutdown.clone(),
                 Arc::clone(&caches),
@@ -183,6 +184,7 @@ pub async fn cmd_download(
                     parallel_chunks: args.parallel_chunks,
                     keep_partial: args.keep_partial,
                     timeouts,
+                    no_album: args.no_album,
                 },
                 shutdown.clone(),
                 Arc::clone(&caches),
@@ -195,6 +197,7 @@ pub async fn cmd_download(
                     peer: args.peer,
                     msg_id: args.msg_id,
                     include_comments: args.include_comments,
+                    no_album: args.no_album,
                 },
                 out_dir: args.out_dir,
                 collision: args.collision,
@@ -211,6 +214,7 @@ pub async fn cmd_download(
                 parallel_chunks: args.parallel_chunks,
                 keep_partial: args.keep_partial,
                 timeouts,
+                continue_on_error: args.continue_on_error,
             };
             match download_one(&client, &request, &shutdown, &caches).await {
                 Ok(result) => {
@@ -265,21 +269,33 @@ pub async fn cmd_inspect(
     ensure_authorized(&client).await?;
     let caches = Arc::new(DownloadCaches::default());
 
-    let message = fetch_message_with_retry(
+    let selector = MessageSelectorArgs {
+        link: args.link,
+        peer: args.peer,
+        msg_id: args.msg_id,
+        include_comments: false,
+        no_album: args.no_album,
+    };
+    let anchor_msg_id = selector.msg_id.or_else(|| {
+        selector.link.as_deref().and_then(|l| crate::link::parse_link(l).ok()).map(|parsed| match parsed {
+            crate::link::ParsedLink::Username { msg_id, .. } => msg_id,
+            crate::link::ParsedLink::Channel { msg_id, .. } => msg_id,
+        })
+    });
+
+    let messages = fetch_messages_with_retry(
         &client,
-        &MessageSelectorArgs {
-            link: args.link,
-            peer: args.peer,
-            msg_id: args.msg_id,
-            include_comments: false,
-        },
+        &selector,
         RetryConfig::default(),
         TimeoutConfig::default(),
         &caches,
     )
     .await?;
 
-    crate::output::write_command_output("inspect", describe_message(&message))?;
+    crate::output::write_command_output(
+        "inspect",
+        describe::describe_messages(&messages, anchor_msg_id),
+    )?;
     Ok(())
 }
 

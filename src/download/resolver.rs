@@ -27,6 +27,7 @@ pub(crate) struct MessageSelectorArgs {
     pub(crate) peer: Option<String>,
     pub(crate) msg_id: Option<i32>,
     pub(crate) include_comments: bool,
+    pub(crate) no_album: bool,
 }
 
 pub(crate) fn warn_about_ambiguous_selector(selector: &MessageSelectorArgs) {
@@ -65,6 +66,7 @@ pub(crate) fn resolve_peer_msg(args: &MessageSelectorArgs) -> Result<(PeerSpec, 
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn fetch_message_with_retry(
     client: &ResilientClient,
     selector: &MessageSelectorArgs,
@@ -84,8 +86,16 @@ pub(crate) async fn fetch_messages_with_retry(
     caches: &DownloadCaches,
 ) -> Result<Vec<Message>> {
     let (peer_spec, msg_id) = resolve_peer_msg(selector)?;
-    let mut messages =
-        fetch_anchor_messages(client, &peer_spec, msg_id, retry, timeouts, caches).await?;
+    let mut messages = fetch_anchor_messages(
+        client,
+        &peer_spec,
+        msg_id,
+        selector.no_album,
+        retry,
+        timeouts,
+        caches,
+    )
+    .await?;
 
     if selector.include_comments {
         let reply_messages =
@@ -102,14 +112,17 @@ async fn fetch_anchor_messages(
     client: &ResilientClient,
     peer_spec: &PeerSpec,
     msg_id: i32,
+    no_album: bool,
     retry: RetryConfig,
     timeouts: TimeoutConfig,
     caches: &DownloadCaches,
 ) -> Result<Vec<Message>> {
     let message = retry_fetch_message(client, peer_spec, msg_id, retry, timeouts, caches).await?;
-    if let Some(grouped_id) = message.grouped_id() {
-        return fetch_grouped_messages(client, peer_spec, msg_id, grouped_id, timeouts, caches)
-            .await;
+    if !no_album {
+        if let Some(grouped_id) = message.grouped_id() {
+            return fetch_grouped_messages(client, peer_spec, msg_id, grouped_id, timeouts, caches)
+                .await;
+        }
     }
 
     Ok(vec![message])
@@ -592,6 +605,7 @@ pub(crate) async fn prefetch_messages_for_entries(
             peer: None,
             msg_id: None,
             include_comments: false,
+            no_album: false,
         };
         if let Ok((peer_spec, msg_id)) = resolve_peer_msg(&selector) {
             grouped.entry(peer_spec).or_default().push(msg_id);
@@ -649,6 +663,7 @@ pub(crate) async fn resolve_target(
             peer: None,
             msg_id: None,
             include_comments: false,
+            no_album: false,
         };
         let (peer_spec, msg_id) = resolve_peer_msg(&selector)?;
         let message =
@@ -682,11 +697,15 @@ pub(crate) async fn resolve_target(
     .await?;
     let peer = resolve_peer_from_ref(client, peer_ref, timeouts, caches).await?;
 
-    Ok(json!({
-        "input": trimmed,
+    Ok(json!(format_peer_output(trimmed, &peer)))
+}
+
+fn format_peer_output(input: &str, peer: &Peer) -> Value {
+    json!({
+        "input": input,
         "input_type": "username",
-        "peer": super::describe::describe_peer(&peer),
-    }))
+        "peer": super::describe::describe_peer(peer),
+    })
 }
 
 pub(crate) fn describe_peer_spec(spec: &PeerSpec) -> Value {

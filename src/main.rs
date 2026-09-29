@@ -143,6 +143,10 @@ enum Commands {
         #[arg(long)]
         include_comments: bool,
 
+        /// Disable automatic expansion of grouped messages (albums).
+        #[arg(long)]
+        no_album: bool,
+
         /// File containing batch input. Use "-" to read from stdin.
         #[arg(long, short = 'f', value_name = "FILE", conflicts_with_all = ["link", "peer", "msg"])]
         file: Option<PathBuf>,
@@ -183,7 +187,7 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = BatchInputFormatArg::Auto)]
         input_format: BatchInputFormatArg,
 
-        /// Continue processing remaining batch items after a failure.
+        /// Continue processing remaining items (or batch items) after a failure.
         #[arg(long, conflicts_with = "fail_fast")]
         continue_on_error: bool,
 
@@ -297,6 +301,10 @@ enum Commands {
         /// Message id (used together with --peer)
         #[arg(long, value_name = "ID", requires = "peer")]
         msg: Option<i32>,
+
+        /// Disable automatic expansion of grouped messages (albums).
+        #[arg(long)]
+        no_album: bool,
     },
 
     /// Validate config, session, and authorization state.
@@ -404,6 +412,7 @@ async fn run(cli: Cli) -> Result<()> {
             peer,
             msg,
             include_comments,
+            no_album,
             file,
             out,
             skip_existing,
@@ -451,7 +460,7 @@ async fn run(cli: Cli) -> Result<()> {
                     msg_id: msg,
                     include_comments,
                     out_dir: out,
-                    file_list: file,
+                    file_list: file.clone(),
                     collision: download::CollisionPolicy::from_flags(
                         skip_existing,
                         overwrite,
@@ -481,7 +490,7 @@ async fn run(cli: Cli) -> Result<()> {
                     to_line,
                     checkpoint,
                     dry_run,
-                    retry_from,
+                    retry_from: retry_from.clone(),
                     log_file: cli.log_file.clone(),
                     success_hook,
                     failure_hook,
@@ -513,11 +522,20 @@ async fn run(cli: Cli) -> Result<()> {
                     request_timeout: request_timeout_ms.map(std::time::Duration::from_millis),
                     item_timeout: item_timeout_ms.map(std::time::Duration::from_millis),
                     batch_timeout: batch_timeout_ms.map(std::time::Duration::from_millis),
+                    no_album,
+                    continue_on_error: continue_on_error
+                        || (file.is_some() && !fail_fast)
+                        || (retry_from.is_some() && !fail_fast),
                 },
             )
             .await?;
         }
-        Commands::Inspect { link, peer, msg } => {
+        Commands::Inspect {
+            link,
+            peer,
+            msg,
+            no_album,
+        } => {
             let api_id = load_api_id(&config_path)?;
             download::cmd_inspect(
                 api_id,
@@ -527,6 +545,7 @@ async fn run(cli: Cli) -> Result<()> {
                     link,
                     peer,
                     msg_id: msg,
+                    no_album,
                 },
             )
             .await?;

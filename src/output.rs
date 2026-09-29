@@ -183,15 +183,47 @@ fn write_human(command: &str, data: &Value) -> Result<()> {
 }
 
 fn write_human_download(data: &Value) -> Result<()> {
+    if let Some(items) = data.get("items").and_then(Value::as_array) {
+        if items.len() > 1 {
+            for item in items {
+                let item_status = item.get("status").and_then(Value::as_str).unwrap_or("-");
+                let path = item.get("file").and_then(Value::as_str).unwrap_or("-");
+                let source = item
+                    .get("canonical_source_link")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                if item_status == "failed" {
+                    let err = item
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error");
+                    println!("failed {} {} ({})", path, source, err);
+                } else {
+                    println!("{} {} {}", item_status, path, source);
+                }
+            }
+            return Ok(());
+        }
+    }
+
     if let Some(status) = data.get("status").and_then(Value::as_str) {
         match status {
-            "downloaded" | "skipped" | "planned" => {
+            "downloaded" | "skipped" | "planned" | "partial" => {
                 let path = data.get("file").and_then(Value::as_str).unwrap_or("-");
                 let source = data
                     .get("canonical_source_link")
                     .and_then(Value::as_str)
                     .unwrap_or("-");
                 println!("{} {} {}", status, path, source);
+            }
+            "failed" => {
+                let path = data.get("file").and_then(Value::as_str).unwrap_or("-");
+                let source = data
+                    .get("canonical_source_link")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                let err = data.get("error").and_then(Value::as_str).unwrap_or("-");
+                println!("failed {} {} ({})", path, source, err);
             }
             "completed" => {
                 println!(
@@ -209,7 +241,85 @@ fn write_human_download(data: &Value) -> Result<()> {
     Ok(())
 }
 
+fn format_media_line(media: &Value) -> String {
+    let media_type = media
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mime = media.get("mime_type").and_then(Value::as_str);
+    let filename = media.get("filename").and_then(Value::as_str);
+    let size = media
+        .get("size")
+        .and_then(Value::as_u64)
+        .map(|s| format!("{} bytes", s));
+
+    let mut parts = vec![format!("type: {}", media_type)];
+    if let Some(f) = filename {
+        parts.push(format!("filename: {}", f));
+    }
+    if let Some(s) = size {
+        parts.push(format!("size: {}", s));
+    }
+    if let Some(m) = mime {
+        parts.push(format!("mime: {}", m));
+    }
+    parts.join(", ")
+}
+
 fn write_human_inspect(data: &Value) -> Result<()> {
+    if let Some(messages) = data.get("messages").and_then(Value::as_array) {
+        let total = messages.len();
+        let requested_id = data.get("requested_message_id").and_then(Value::as_i64);
+        let grouped_id = data.get("grouped_id").and_then(Value::as_i64);
+
+        if let Some(gid) = grouped_id {
+            println!("Album Group ID: {} ({} items)", gid, total);
+        } else {
+            println!("Messages ({} items)", total);
+        }
+
+        for (idx, msg) in messages.iter().enumerate() {
+            let msg_id = msg.get("id").and_then(Value::as_i64).unwrap_or(0);
+            let is_requested = requested_id.map_or(false, |rid| rid == msg_id);
+            let req_indicator = if is_requested { " [requested]" } else { "" };
+
+            println!(
+                "
+  [{}/{}] Message #{}{}:",
+                idx + 1,
+                total,
+                msg_id,
+                req_indicator
+            );
+            if let Some(date) = msg.get("date").and_then(Value::as_str) {
+                println!("    Date: {}", date);
+            }
+            if let Some(src) = msg.get("canonical_source_link").and_then(Value::as_str) {
+                println!("    Link: {}", src);
+            }
+            if let Some(media) = msg.get("media") {
+                if !media.is_null() {
+                    println!("    Media: {}", format_media_line(media));
+                } else {
+                    println!("    Media: none");
+                }
+            }
+            if let Some(text) = msg.get("text").and_then(Value::as_str) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    let first_line = trimmed.lines().next().unwrap_or("");
+                    let truncated = if first_line.chars().count() > 80 {
+                        format!("{}...", first_line.chars().take(80).collect::<String>())
+                    } else {
+                        first_line.to_string()
+                    };
+                    println!("    Text: {}", truncated);
+                }
+            }
+        }
+        return Ok(());
+    }
+
     println!(
         "message {} in {}",
         data.get("id").and_then(Value::as_i64).unwrap_or_default(),
