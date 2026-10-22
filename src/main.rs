@@ -102,6 +102,12 @@ enum Commands {
     /// Remove the saved Telegram session.
     Logout,
 
+    /// Session maintenance commands.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommands,
+    },
+
     /// Print the currently authenticated user's info (JSON).
     Whoami,
 
@@ -325,6 +331,14 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum SessionCommands {
+    /// Drop cached per-datacenter auth keys so they are re-exported on next use.
+    ///
+    /// Keeps the account authorization intact; no login code is required.
+    Repair,
+}
+
+#[derive(Subcommand)]
 enum ManifestCommands {
     /// Export a checkpoint or manifest to JSON or JSONL.
     Export {
@@ -395,6 +409,12 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Logout => {
             auth::cmd_logout(&session_path, cli.yes)?;
         }
+        Commands::Session { command } => match command {
+            SessionCommands::Repair => {
+                let api_id = load_api_id(&config_path)?;
+                auth::cmd_session_repair(api_id, session_path, session_options).await?;
+            }
+        },
         Commands::Whoami => {
             let api_id = load_api_id(&config_path)?;
             auth::cmd_whoami(api_id, session_path, session_options).await?;

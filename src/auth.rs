@@ -192,6 +192,45 @@ pub async fn cmd_whoami(
     Ok(())
 }
 
+/// `session repair` command – drop cached per-datacenter auth keys while keeping
+/// the account authorization intact.
+///
+/// Useful after Telegram revokes the sessions: the home datacenter may still be
+/// authorized while keys cached for media datacenters are dead.
+pub async fn cmd_session_repair(
+    api_id: i32,
+    session_path: PathBuf,
+    session_options: SessionOptions,
+) -> Result<()> {
+    if !session_path.exists() {
+        anyhow::bail!(
+            "No session found at '{}'. Run `tw-dl login` first.",
+            session_path.display()
+        );
+    }
+
+    let client = build_client(api_id, &session_path, session_options).await?;
+
+    if !client.is_authorized().await? {
+        anyhow::bail!(
+            "Session at '{}' is not authorized. Run `tw-dl login` first.",
+            session_path.display()
+        );
+    }
+
+    let cleared = discard_stale_dc_auth_keys(client.session.as_ref()).await;
+    crate::output::write_command_output(
+        "session-repair",
+        serde_json::json!({
+            "authorized": true,
+            "cleared_dc_keys": cleared,
+            "session_path": session_path.display().to_string(),
+        }),
+    )?;
+
+    Ok(())
+}
+
 pub fn cmd_logout(session_path: &Path, yes: bool) -> Result<()> {
     if (session_path.exists() || session_path.with_extension("lock").exists()) && !yes {
         confirm_action(format!(

@@ -172,13 +172,16 @@ pub(crate) async fn download_one(
         }
     };
 
-    if let Some(timeout) = request.timeouts.item_timeout {
+    let result = if let Some(timeout) = request.timeouts.item_timeout {
         tokio::time::timeout(timeout, operation)
             .await
-            .context("Per-item timeout exceeded")?
+            .context("Per-item timeout exceeded")
+            .and_then(|result| result)
     } else {
         operation.await
-    }
+    };
+
+    result.map_err(super::retry::hint_invalid_session)
 }
 
 pub(crate) async fn download_media(
@@ -194,6 +197,7 @@ pub(crate) async fn download_media(
         let resolved = match resolve_download_target(request, message).await {
             Ok(res) => res,
             Err(e) => {
+                let e = super::retry::hint_invalid_session(e);
                 if request.continue_on_error {
                     crate::output::stderrln(format!(
                         "Download error for message #{}: {:#}",
@@ -235,6 +239,7 @@ pub(crate) async fn download_media(
         let outcome = match outcome_result {
             Ok(outcome) => outcome,
             Err(e) => {
+                let e = super::retry::hint_invalid_session(e);
                 if request.continue_on_error {
                     crate::output::stderrln(format!(
                         "Download error for '{}': {:#}",

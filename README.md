@@ -165,6 +165,7 @@ Commands:
 - `init` - create `~/.config/tw-dl/config.toml` interactively
 - `login` - authenticate and save a session
 - `logout` - remove the saved session
+- `session repair` - refresh cached per-datacenter session keys (no re-login needed)
 - `whoami` - print the authenticated user as JSON
 - `list-chats` - list accessible chats as JSON
 - `resolve` - resolve a link, username, or numeric id as JSON
@@ -241,6 +242,25 @@ tw-dl logout
 Options:
 
 - `--session-path <FILE>`: path to the session file
+
+### `session repair`
+
+Drop cached per-datacenter auth keys so `tw-dl` re-exports them on the next
+media request. The account authorization is kept intact, so no login code is
+required.
+
+```bash
+tw-dl session repair
+tw-dl --json session repair
+```
+
+Use this when downloads fail with `401: SESSION_REVOKED` after Telegram revoked
+a session, while `tw-dl whoami` still works.
+
+Options:
+
+- `--session-path <FILE>`: path to the session file
+- `--json`: emit the repair result as JSON
 
 ### `whoami`
 
@@ -657,6 +677,7 @@ During downloads, progress is shown on stderr.
 The progress display includes:
 
 - transfer throughput
+- message id of the item being downloaded
 - ETA for sized downloads
 - total retry count
 - current backoff delay when a retry is pending
@@ -792,6 +813,22 @@ Run:
 ```bash
 tw-dl login
 ```
+
+### `SESSION_REVOKED` (401)
+
+Telegram invalidated the session, for example after logging out on another
+device or after contacting support. The account authorization may still work on
+the home datacenter while the cached per-datacenter media keys are dead, so
+`tw-dl whoami` succeeds but downloads fail.
+
+Repair the cached keys without signing in again:
+
+```bash
+tw-dl session repair
+```
+
+If the account session itself is no longer authorized, `session repair` tells
+you to run `tw-dl login`.
 
 ### `Username '...' not found`
 

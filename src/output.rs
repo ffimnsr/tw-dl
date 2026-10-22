@@ -176,6 +176,7 @@ fn write_human(command: &str, data: &Value) -> Result<()> {
         "list-chats" => write_human_list_chats(data),
         "resolve" => write_human_resolve(data),
         "whoami" => write_human_whoami(data),
+        "session-repair" => write_human_session_repair(data),
         "doctor" => write_human_doctor(data),
         "manifest-export" | "manifest-import" => write_human_manifest(command, data),
         _ => write_json_pretty(&command_output(command, data.clone())),
@@ -360,6 +361,22 @@ fn write_human_whoami(data: &Value) -> Result<()> {
         data.get("username").and_then(Value::as_str).unwrap_or("-"),
         data.get("phone").and_then(Value::as_str).unwrap_or("-")
     );
+    Ok(())
+}
+
+fn write_human_session_repair(data: &Value) -> Result<()> {
+    let cleared = data
+        .get("cleared_dc_keys")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if cleared == 0 {
+        println!("Session is healthy; no cached datacenter keys to clear.");
+    } else {
+        println!(
+            "Repaired session: cleared {} cached datacenter key(s); they will be re-exported on next use.",
+            cleared
+        );
+    }
     Ok(())
 }
 

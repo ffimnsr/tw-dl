@@ -83,6 +83,36 @@ pub(crate) fn is_retryable_error(message: &str) -> bool {
     .any(|pattern| normalized.contains(pattern))
 }
 
+/// Actionable hint attached to session-level failures.
+pub(crate) const SESSION_REPAIR_HINT: &str = "Telegram revoked this session's media authorization; run `tw-dl session repair` to refresh its cached datacenter keys";
+
+/// Whether the error means the Telegram session itself is no longer usable
+/// (revoked/expired authorization, or an unregistered auth key).
+pub(crate) fn is_invalid_session_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "session_revoked",
+        "session_expired",
+        "auth_key_unregistered",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+}
+
+/// Attach the repair hint to session-level failures, without duplicating it when
+/// the error already carries it.
+pub(crate) fn hint_invalid_session(error: anyhow::Error) -> anyhow::Error {
+    if error.to_string().contains(SESSION_REPAIR_HINT) {
+        return error;
+    }
+
+    if is_invalid_session_error(&error.to_string()) {
+        error.context(SESSION_REPAIR_HINT)
+    } else {
+        error
+    }
+}
+
 pub(crate) fn should_reconnect(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     [
@@ -101,6 +131,10 @@ pub(crate) fn should_reconnect(message: &str) -> bool {
 }
 
 pub(crate) fn is_permanent_error(normalized_message: &str) -> bool {
+    if is_invalid_session_error(normalized_message) {
+        return true;
+    }
+
     [
         "not logged in",
         "username '",
@@ -114,9 +148,6 @@ pub(crate) fn is_permanent_error(normalized_message: &str) -> bool {
         "phone code expired",
         "password hash invalid",
         "session password needed",
-        "session_revoked",
-        "session_expired",
-        "auth_key_unregistered",
         "unauthorized",
         "forbidden",
         "access denied",
@@ -149,6 +180,36 @@ mod tests {
         );
         assert!(!is_retryable_error(&error.to_string()));
         assert!(retryable_delay(&error, 1, RetryConfig::default()).is_none());
+    }
+
+    #[test]
+    fn test_invalid_session_error_detection() {
+        assert!(is_invalid_session_error("rpc error 401: SESSION_REVOKED"));
+        assert!(is_invalid_session_error("AUTH_KEY_UNREGISTERED"));
+        assert!(!is_invalid_session_error("FLOOD_WAIT_12"));
+    }
+
+    #[test]
+    fn test_hint_invalid_session_is_idempotent() {
+        let error = anyhow::anyhow!(
+            "Download error: request error: rpc error 401: SESSION_REVOKED caused by upload.getFile"
+        );
+        let hinted = hint_invalid_session(error);
+        assert!(hinted.to_string().contains(SESSION_REPAIR_HINT));
+
+        let twice = hint_invalid_session(hinted);
+        assert_eq!(
+            format!("{:#}", twice).matches(SESSION_REPAIR_HINT).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_hint_invalid_session_skips_unrelated_errors() {
+        let error = anyhow::anyhow!("connection reset by peer");
+        assert!(!hint_invalid_session(error)
+            .to_string()
+            .contains(SESSION_REPAIR_HINT));
     }
 
     #[test]
