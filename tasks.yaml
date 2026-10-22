@@ -6,3 +6,7 @@ tasks:
     commands:
       - cargo install --path . --locked
     description: Install the package
+  install-local:
+    commands:
+      - cargo install --path . --locked --root "$HOME/.local"
+    description: Install the package to ~/.local/bin

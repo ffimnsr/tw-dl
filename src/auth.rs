@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use grammers_client::{Client, SenderPool, SignInError};
 use grammers_session::storages::SqliteSession;
+use grammers_session::Session;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
@@ -32,12 +33,21 @@ impl Default for SessionOptions {
 /// that processes all low-level MTProto I/O).
 pub async fn build_client(
     api_id: i32,
-    session_path: &PathBuf,
+    session_path: &Path,
     session_options: SessionOptions,
 ) -> Result<AppClient> {
     crate::session::ensure_parent_dir(session_path)?;
     let session_lock = SessionLock::acquire(session_path, session_options)?;
+    build_client_with_lock(api_id, session_path, session_lock).await
+}
 
+/// Build a client while the caller transfers ownership of an already-acquired
+/// session lock. Reconnecting uses this to avoid tripping over its own lock file.
+async fn build_client_with_lock(
+    api_id: i32,
+    session_path: &Path,
+    session_lock: SessionLock,
+) -> Result<AppClient> {
     let session = Arc::new(
         SqliteSession::open(session_path)
             .await
@@ -53,8 +63,38 @@ pub async fn build_client(
 
     Ok(AppClient {
         client,
-        _session_lock: session_lock,
+        session,
+        session_lock: Some(session_lock),
     })
+}
+
+/// Drop auth keys cached for secondary datacenters.
+///
+/// Exported per-DC authorizations are tied to the account's login session. After
+/// Telegram revokes a session (for example from another device or via support),
+/// the keys cached for other DCs are dead while the home DC may still work. Media
+/// requests then fail with `SESSION_REVOKED`. Clearing the cached keys makes
+/// grammers export a fresh authorization the next time that DC is used.
+async fn discard_stale_dc_auth_keys(session: &dyn Session) -> usize {
+    let home_dc = session.home_dc_id();
+    let mut cleared = 0;
+
+    for dc_id in 1..=5 {
+        if dc_id == home_dc {
+            continue;
+        }
+        let Some(mut option) = session.dc_option(dc_id) else {
+            continue;
+        };
+        if option.auth_key.is_none() {
+            continue;
+        }
+        option.auth_key = None;
+        session.set_dc_option(&option).await;
+        cleared += 1;
+    }
+
+    cleared
 }
 
 /// Interactive `login` command.
@@ -71,6 +111,7 @@ pub async fn cmd_login(
 
     if client.is_authorized().await? {
         println!("Already logged in. Use `tw-dl whoami` to see current user.");
+        report_discarded_dc_auth_keys(&client).await;
         return Ok(());
     }
 
@@ -104,8 +145,19 @@ pub async fn cmd_login(
         }
     }
 
+    report_discarded_dc_auth_keys(&client).await;
     println!("Session saved to '{}'.", session_path.display());
     Ok(())
+}
+
+async fn report_discarded_dc_auth_keys(client: &AppClient) {
+    let cleared = discard_stale_dc_auth_keys(client.session.as_ref()).await;
+    if cleared > 0 {
+        println!(
+            "Cleared {} cached datacenter session key(s); they will be re-exported on next use.",
+            cleared
+        );
+    }
 }
 
 /// `whoami` command – prints the currently logged-in user's details as JSON.
@@ -203,12 +255,26 @@ fn display_name(user: &grammers_client::peer::User) -> String {
 
 pub struct AppClient {
     client: Client,
-    _session_lock: SessionLock,
+    session: Arc<SqliteSession>,
+    session_lock: Option<SessionLock>,
 }
 
 impl AppClient {
     pub fn client(&self) -> Client {
         self.client.clone()
+    }
+
+    /// Replace the underlying client with a fresh connection while keeping the
+    /// existing session lock. The old sender pool is dropped once the swap is done.
+    pub(crate) async fn reconnect(&mut self, api_id: i32, session_path: &Path) -> Result<()> {
+        let session_lock = self
+            .session_lock
+            .take()
+            .context("Session lock was already released")?;
+
+        let mut rebuilt = build_client_with_lock(api_id, session_path, session_lock).await?;
+        std::mem::swap(self, &mut rebuilt);
+        Ok(())
     }
 }
 
@@ -302,5 +368,70 @@ fn unix_timestamp() -> u64 {
 impl Drop for SessionLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grammers_session::storages::MemorySession;
+    use grammers_session::types::DcOption;
+
+    fn dc_option(id: i32) -> DcOption {
+        DcOption {
+            id,
+            ipv4: "149.154.167.92:443".parse().unwrap(),
+            ipv6: "[2001:67c:4e8:f004::a]:443".parse().unwrap(),
+            auth_key: Some([7u8; 256]),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discard_stale_dc_auth_keys_keeps_home_dc() {
+        let session = MemorySession::default();
+        session.set_home_dc_id(5).await;
+        session.set_dc_option(&dc_option(4)).await;
+        session.set_dc_option(&dc_option(5)).await;
+
+        let cleared = discard_stale_dc_auth_keys(&session).await;
+
+        assert_eq!(cleared, 1);
+        assert!(session.dc_option(4).unwrap().auth_key.is_none());
+        assert!(session.dc_option(5).unwrap().auth_key.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_discard_stale_dc_auth_keys_is_idempotent() {
+        let session = MemorySession::default();
+        session.set_home_dc_id(5).await;
+        session.set_dc_option(&dc_option(4)).await;
+
+        assert_eq!(discard_stale_dc_auth_keys(&session).await, 1);
+        assert_eq!(discard_stale_dc_auth_keys(&session).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_reuses_session_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "tw-dl-reconnect-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session_path = dir.join("session");
+        let lock_path = session_path.with_extension("lock");
+
+        let mut client = build_client(12345, &session_path, SessionOptions::default())
+            .await
+            .unwrap();
+        assert!(lock_path.exists());
+
+        client.reconnect(12345, &session_path).await.unwrap();
+        assert!(lock_path.exists());
+
+        drop(client);
+        assert!(!lock_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -114,6 +114,9 @@ pub(crate) fn is_permanent_error(normalized_message: &str) -> bool {
         "phone code expired",
         "password hash invalid",
         "session password needed",
+        "session_revoked",
+        "session_expired",
+        "auth_key_unregistered",
         "unauthorized",
         "forbidden",
         "access denied",
@@ -137,6 +140,15 @@ mod tests {
         assert!(is_retryable_error("network timeout while downloading"));
         assert!(!is_retryable_error("username not found"));
         assert!(!is_retryable_error("CHANNEL_PRIVATE"));
+    }
+
+    #[test]
+    fn test_revoked_session_is_permanent() {
+        let error = anyhow::anyhow!(
+            "Download error: request error: rpc error 401: SESSION_REVOKED caused by upload.getFile"
+        );
+        assert!(!is_retryable_error(&error.to_string()));
+        assert!(retryable_delay(&error, 1, RetryConfig::default()).is_none());
     }
 
     #[test]

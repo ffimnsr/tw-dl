@@ -30,7 +30,6 @@ pub(crate) struct DownloadCaches {
 pub(crate) struct ResilientClient {
     pub(crate) api_id: i32,
     pub(crate) session_path: PathBuf,
-    pub(crate) session_options: crate::auth::SessionOptions,
     inner: tokio::sync::Mutex<crate::auth::AppClient>,
     pacing_until: tokio::sync::Mutex<Option<tokio::time::Instant>>,
 }
@@ -45,7 +44,6 @@ impl ResilientClient {
         Ok(Self {
             api_id,
             session_path,
-            session_options,
             inner: tokio::sync::Mutex::new(inner),
             pacing_until: tokio::sync::Mutex::new(None),
         })
@@ -57,9 +55,7 @@ impl ResilientClient {
 
     pub(crate) async fn reconnect(&self) -> Result<()> {
         let mut guard = self.inner.lock().await;
-        *guard = crate::auth::build_client(self.api_id, &self.session_path, self.session_options)
-            .await?;
-        Ok(())
+        guard.reconnect(self.api_id, &self.session_path).await
     }
 
     pub(crate) async fn wait_for_pacing(&self) {

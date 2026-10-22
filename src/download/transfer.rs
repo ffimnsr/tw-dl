@@ -116,6 +116,7 @@ pub(crate) enum PreparedDownload {
 }
 
 struct StreamDownloadConfig {
+    msg_id: i32,
     total_bytes: u64,
     collision: CollisionPolicy,
     retry: RetryConfig,
@@ -222,10 +223,12 @@ pub(crate) async fn download_media(
 
         let outcome_result = match &source {
             DownloadSource::Document(doc) => {
-                stream_download_verified(client, doc, &target, request, shutdown).await
+                stream_download_verified(client, doc, &target, request, message.id(), shutdown)
+                    .await
             }
             DownloadSource::Photo(photo) => {
-                stream_download_verified(client, photo, &target, request, shutdown).await
+                stream_download_verified(client, photo, &target, request, message.id(), shutdown)
+                    .await
             }
         };
 
@@ -532,6 +535,7 @@ async fn stream_download_verified<D: Downloadable + Clone + Send + Sync + 'stati
     downloadable: &D,
     target: &ResolvedDownloadTarget,
     request: &SingleDownloadRequest,
+    msg_id: i32,
     shutdown: &AtomicBool,
 ) -> Result<DownloadOutcome> {
     let mut redownloaded = false;
@@ -541,6 +545,7 @@ async fn stream_download_verified<D: Downloadable + Clone + Send + Sync + 'stati
             downloadable,
             &target.out_path,
             StreamDownloadConfig {
+                msg_id,
                 total_bytes: target.expected_size,
                 collision: if redownloaded {
                     CollisionPolicy::Overwrite
@@ -624,7 +629,12 @@ async fn stream_download<D: Downloadable + Clone + Send + Sync + 'static>(
         );
     }
 
-    let pb = make_progress_bar(config.total_bytes, initial_bytes, config.parallel_chunks);
+    let pb = make_progress_bar(
+        config.total_bytes,
+        initial_bytes,
+        config.parallel_chunks,
+        config.msg_id,
+    );
     update_progress_status(&pb, 0, None, config.parallel_chunks);
 
     if config.parallel_chunks > 1
@@ -1018,7 +1028,12 @@ pub(crate) async fn prepare_output_file(
 
 // ── progress bar ───────────────────────────────────────────────────────────────
 
-fn make_progress_bar(total_bytes: u64, initial_bytes: u64, parallel_chunks: usize) -> ProgressBar {
+fn make_progress_bar(
+    total_bytes: u64,
+    initial_bytes: u64,
+    parallel_chunks: usize,
+    msg_id: i32,
+) -> ProgressBar {
     if !crate::output::progress_enabled() {
         return ProgressBar::hidden();
     }
@@ -1027,11 +1042,12 @@ fn make_progress_bar(total_bytes: u64, initial_bytes: u64, parallel_chunks: usiz
         let pb = ProgressBar::new(total_bytes);
         pb.set_style(
             ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} @ {bytes_per_sec} ({eta}) {msg}",
+                "{spinner:.green} {prefix}[{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} @ {bytes_per_sec} ({eta}) {msg}",
             )
             .unwrap()
             .progress_chars("#>-"),
         );
+        pb.set_prefix(format!("[{}] ", msg_id));
         pb.set_position(initial_bytes);
         update_progress_status(&pb, 0, None, parallel_chunks);
         pb
@@ -1039,10 +1055,11 @@ fn make_progress_bar(total_bytes: u64, initial_bytes: u64, parallel_chunks: usiz
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] {bytes} downloaded @ {bytes_per_sec} {msg}",
+                "{spinner:.green} {prefix}[{elapsed_precise}] {bytes} downloaded @ {bytes_per_sec} {msg}",
             )
             .unwrap(),
         );
+        pb.set_prefix(format!("[{}] ", msg_id));
         pb.inc(initial_bytes);
         update_progress_status(&pb, 0, None, parallel_chunks);
         pb
