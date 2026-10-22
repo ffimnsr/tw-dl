@@ -830,6 +830,13 @@ tw-dl session repair
 If the account session itself is no longer authorized, `session repair` tells
 you to run `tw-dl login`.
 
+### `FILE_REFERENCE_EXPIRED` (400)
+
+Telegram's per-file references expire, which can happen during long transfers.
+`tw-dl` automatically re-fetches the message with a fresh reference and resumes
+from the `.part` file, up to 5 times per item. If it still fails, rerun the same
+command with `--resume` to continue from the partial download.
+
 ### `Username '...' not found`
 
 - check the username

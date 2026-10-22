@@ -399,6 +399,39 @@ pub(crate) async fn retry_fetch_message(
     }
 }
 
+/// Fetch a message again to obtain a fresh media `file_reference`.
+///
+/// This bypasses the in-process message cache on purpose: cached messages keep
+/// the file reference they were fetched with, which Telegram may have expired.
+pub(crate) async fn refetch_message(
+    client: &ResilientClient,
+    message: &Message,
+    timeouts: TimeoutConfig,
+) -> Result<Message> {
+    let msg_id = message.id();
+    let peer_ref = message.peer_ref().await.with_context(|| {
+        format!(
+            "Cannot refresh message #{}: peer reference is unavailable",
+            msg_id
+        )
+    })?;
+
+    client.wait_for_pacing().await;
+    let current_client = client.client().await;
+    let mut fetched = run_request(
+        timeouts.request_timeout,
+        "Message refresh request timed out",
+        current_client.get_messages_by_id(peer_ref, &[msg_id]),
+    )
+    .await
+    .with_context(|| format!("Failed to refresh message #{}", msg_id))??;
+
+    fetched
+        .pop()
+        .flatten()
+        .with_context(|| format!("Message #{} not found while refreshing its media", msg_id))
+}
+
 async fn fetch_message_once(
     client: &ResilientClient,
     spec: &PeerSpec,

@@ -99,6 +99,18 @@ pub(crate) fn is_invalid_session_error(message: &str) -> bool {
     .any(|pattern| normalized.contains(pattern))
 }
 
+/// Whether the error means the media's `file_reference` is no longer valid.
+///
+/// Telegram file references expire over time, so long downloads can fail partway
+/// through. The fix is to re-fetch the message and resume with the new reference,
+/// not to retry the same location.
+pub(crate) fn is_file_reference_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    ["file_reference_expired", "file_reference_invalid"]
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
+}
+
 /// Attach the repair hint to session-level failures, without duplicating it when
 /// the error already carries it.
 pub(crate) fn hint_invalid_session(error: anyhow::Error) -> anyhow::Error {
@@ -131,7 +143,7 @@ pub(crate) fn should_reconnect(message: &str) -> bool {
 }
 
 pub(crate) fn is_permanent_error(normalized_message: &str) -> bool {
-    if is_invalid_session_error(normalized_message) {
+    if is_invalid_session_error(normalized_message) || is_file_reference_error(normalized_message) {
         return true;
     }
 
@@ -187,6 +199,16 @@ mod tests {
         assert!(is_invalid_session_error("rpc error 401: SESSION_REVOKED"));
         assert!(is_invalid_session_error("AUTH_KEY_UNREGISTERED"));
         assert!(!is_invalid_session_error("FLOOD_WAIT_12"));
+    }
+
+    #[test]
+    fn test_file_reference_error_is_permanent() {
+        let error = anyhow::anyhow!(
+            "Download error: request error: rpc error 400: FILE_REFERENCE_EXPIRED caused by upload.getFile"
+        );
+        assert!(is_file_reference_error(&error.to_string()));
+        assert!(!is_retryable_error(&error.to_string()));
+        assert!(retryable_delay(&error, 1, RetryConfig::default()).is_none());
     }
 
     #[test]

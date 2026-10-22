@@ -21,9 +21,9 @@ use tokio::task::JoinSet;
 use super::client::{run_request, ResilientClient};
 use super::describe::{canonical_source_link, describe_message, describe_peer};
 use super::resolver::{
-    fetch_messages_with_retry, warn_about_ambiguous_selector, MessageSelectorArgs,
+    fetch_messages_with_retry, refetch_message, warn_about_ambiguous_selector, MessageSelectorArgs,
 };
-use super::retry::{prepare_retry, retryable_delay};
+use super::retry::{is_file_reference_error, prepare_retry, retryable_delay};
 use super::types::{
     CaptionSidecarFormat, CollisionPolicy, MediaVariant, OutputLayout, RetryConfig, TimeoutConfig,
 };
@@ -31,9 +31,13 @@ use super::types::{
 const DOWNLOAD_CHUNK_SIZE: i32 = 128 * 1024;
 const MAX_PARALLEL_CHUNK_SIZE: i32 = 512 * 1024;
 const PARALLEL_DOWNLOAD_THRESHOLD: u64 = 10 * 1024 * 1024;
+/// Telegram file references can expire during very long transfers, so allow a
+/// few refresh-and-resume cycles per item before giving up.
+const MAX_REFERENCE_REFRESHES: u32 = 5;
 
 // ── request struct ─────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub(crate) struct SingleDownloadRequest {
     pub(crate) selector: MessageSelectorArgs,
     pub(crate) out_dir: PathBuf,
@@ -221,18 +225,91 @@ pub(crate) async fn download_media(
             }
         };
 
-        let Some((target, source)) = resolved else {
+        let Some((target, mut source)) = resolved else {
             continue;
         };
 
-        let outcome_result = match &source {
-            DownloadSource::Document(doc) => {
-                stream_download_verified(client, doc, &target, request, message.id(), shutdown)
+        let mut reference_refreshes = 0u32;
+        let mut retry_request: Option<SingleDownloadRequest> = None;
+        let outcome_result = loop {
+            let active_request = retry_request.as_ref().unwrap_or(request);
+            let result = match &source {
+                DownloadSource::Document(doc) => {
+                    stream_download_verified(
+                        client,
+                        doc,
+                        &target,
+                        active_request,
+                        message.id(),
+                        shutdown,
+                    )
                     .await
-            }
-            DownloadSource::Photo(photo) => {
-                stream_download_verified(client, photo, &target, request, message.id(), shutdown)
+                }
+                DownloadSource::Photo(photo) => {
+                    stream_download_verified(
+                        client,
+                        photo,
+                        &target,
+                        active_request,
+                        message.id(),
+                        shutdown,
+                    )
                     .await
+                }
+            };
+
+            match result {
+                Ok(outcome) => break Ok(outcome),
+                Err(error)
+                    if reference_refreshes < MAX_REFERENCE_REFRESHES
+                        && is_file_reference_error(&error.to_string()) =>
+                {
+                    reference_refreshes += 1;
+                    match refetch_message(client, message, request.timeouts).await {
+                        Ok(fresh_message) => {
+                            match resolve_download_target(active_request, &fresh_message).await {
+                                Ok(Some((_, fresh_source))) => {
+                                    crate::output::stderrln(format!(
+                                        "Media reference expired for message #{}; refreshed it and resuming.",
+                                        message.id()
+                                    ));
+                                    // A preallocated parallel partial cannot be resumed safely.
+                                    if request.parallel_chunks > 1 {
+                                        let partial = partial_download_path(&target.out_path);
+                                        let _ = fs::remove_file(&partial).await;
+                                    }
+                                    // Retries resume our partial even if the user's collision
+                                    // policy would normally reject an existing temp file.
+                                    let mut next_request = request.clone();
+                                    if matches!(next_request.collision, CollisionPolicy::Error) {
+                                        next_request.collision = CollisionPolicy::Resume;
+                                    }
+                                    retry_request = Some(next_request);
+                                    source = fresh_source;
+                                    continue;
+                                }
+                                Ok(None) => break Err(error),
+                                Err(refresh_error) => {
+                                    crate::output::stderrln(format!(
+                                        "Failed to refresh media for message #{}: {:#}",
+                                        message.id(),
+                                        refresh_error
+                                    ));
+                                    break Err(error);
+                                }
+                            }
+                        }
+                        Err(refresh_error) => {
+                            crate::output::stderrln(format!(
+                                "Failed to refresh media for message #{}: {:#}",
+                                message.id(),
+                                refresh_error
+                            ));
+                            break Err(error);
+                        }
+                    }
+                }
+                Err(error) => break Err(error),
             }
         };
 
@@ -769,6 +846,16 @@ async fn stream_download<D: Downloadable + Clone + Send + Sync + 'static>(
                             ));
                         }
                         break;
+                    }
+
+                    if is_file_reference_error(&error.to_string()) {
+                        // The caller refreshes the media reference and resumes; keep the partial
+                        // file even when the user did not ask to keep partials.
+                        pb.abandon_with_message(
+                            "Media reference expired; refreshing and resuming.",
+                        );
+                        writer.flush().await.ok();
+                        return Err(error);
                     }
 
                     finalize_partial_failure(&pb, &temp_path, config.keep_partial).await;
